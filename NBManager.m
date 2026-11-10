@@ -338,6 +338,10 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
 
 // 微调
 @property (strong, nonatomic) UIImageView *adjustView;
+@property (assign, nonatomic) CGSize adjustScale;      // 图像 -> 视图 缩放
+@property (assign, nonatomic) CGPoint adjustOffset;
+@property (assign, nonatomic) CGRect adjustRefFrame;   // 车视图在父视图里的 frame
+@property (assign, nonatomic) CGSize adjustImageSize;
 @property (copy,   nonatomic) NSString *pickingSlot;
 @property (copy,   nonatomic) NSString *adjustTarget;
 @property (strong, nonatomic) UIPanGestureRecognizer *adjustPan;
@@ -731,10 +735,10 @@ static void NBFillRectWithBand(CGContextRef c, UIImage *src, CGRect rect, CGSize
     if (!v || !veh || !v.superview) return;
     if (!self.carOriginals) self.carOriginals = [NSMapTable weakToStrongObjectsMapTable];
 
-    UIImage *ov = [self renderVehicleOverlay:veh size:v.bounds.size];
-    if (!ov) return;
-    self.vehicleOverlayImage = ov;
+    UIViewContentMode mode = UIViewContentModeScaleAspectFit;
+    if ([v isKindOfClass:[UIImageView class]]) mode = ((UIImageView *)v).contentMode;
 
+    // 先把原车图记下来（第一次调用就要拿到，否则画布尺寸会先用成 bounds）
     if (![self.carOriginals objectForKey:v]) {
         NSMutableDictionary *rec = [NSMutableDictionary dictionary];
         rec[@"hidden"] = @(v.hidden);
@@ -751,10 +755,20 @@ static void NBFillRectWithBand(CGContextRef c, UIImage *src, CGRect rect, CGSize
             rec[@"gravity"] = v.layer.contentsGravity ?: @"";
         }
         [self.carOriginals setObject:rec forKey:v];
-        NBLOG(@"[车视图] 记录 %@ bounds=%@ 原图=%@", NSStringFromClass([v class]),
+        NBLOG(@"[车视图] 记录 %@ bounds=%@ 原图=%@ mode=%ld", NSStringFromClass([v class]),
               NSStringFromCGRect(v.bounds),
-              rec[@"image"] ? NSStringFromCGSize([(UIImage *)rec[@"image"] size]) : @"-");
+              rec[@"image"] ? NSStringFromCGSize([(UIImage *)rec[@"image"] size]) : @"-",
+              (long)mode);
     }
+
+    // 关键：画布尺寸要跟「原车图本身」一致，而不是跟视图 bounds 一致。
+    // 原车图往往比 276×242 的视图大得多，App 靠 contentMode 让它溢出绘制
+    // （这也是替换后总显得比原车小的原因）。尺寸一致 + 模式一致 = 真正的 1:1 替身。
+    CGSize canvas = self.originalCarImage.size;
+    if (canvas.width < 1 || canvas.height < 1) canvas = v.bounds.size;
+    UIImage *ov = [self renderVehicleOverlay:veh size:canvas];
+    if (!ov) return;
+    self.vehicleOverlayImage = ov;
 
     // 贴一层我们自己的车辆视图到同一位置，然后把 App 的车辆视图藏起来。
     // 为什么"藏"而不是"改 image"：按钮类的图会被 App 在 layout / 状态切换时
@@ -763,10 +777,10 @@ static void NBFillRectWithBand(CGContextRef c, UIImage *src, CGRect rect, CGSize
     if (!self.vehicleView) {
         UIImageView *vv = [UIImageView new];
         vv.userInteractionEnabled = NO;                  // 让点击穿透到下面的按钮
-        vv.contentMode = UIViewContentModeScaleToFill;   // 与原位置同尺寸，1:1 贴合
         vv.backgroundColor = [UIColor clearColor];
         self.vehicleView = vv;
     }
+    self.vehicleView.contentMode = mode;                 // 与原车图完全一致的排版模式
     self.vehicleView.image = ov;
     self.vehicleView.frame = v.frame;
     self.vehicleView.autoresizingMask = v.autoresizingMask;
@@ -775,6 +789,10 @@ static void NBFillRectWithBand(CGContextRef c, UIImage *src, CGRect rect, CGSize
         [v.superview insertSubview:self.vehicleView aboveSubview:v];
     }
     v.hidden = YES;
+    // 微调框要始终在最上层，否则会被我们贴的图盖住
+    if (self.adjustView && self.adjustView.superview == v.superview) {
+        [v.superview bringSubviewToFront:self.adjustView];
+    }
 }
 
 - (void)restoreCarViews {
@@ -974,19 +992,34 @@ static void NBFillRectWithBand(CGContextRef c, UIImage *src, CGRect rect, CGSize
 
 - (void)beginAdjust:(NSString *)target {
     UIImageView *stage = [self findStageImageView];
-    if (!stage) { [self alertDone:@"没找到车辆舞台区域，请回到车控页再试"]; return; }
+    if (!stage) { [self alertDone:@"没找到车辆区域，请回到车控页再试"]; return; }
     if (![self storedPathForSlot:@"veh"]) { [self alertDone:@"还没有替换车辆图片"]; return; }
 
     self.stageView = stage;
     self.carViews = [self visibleCarViewsForStage:stage];
-    UIView *host = self.carViews.count ? self.carViews.firstObject : stage;
+    UIView *v = self.carViews.firstObject;
+    if (!v || !v.superview) { [self alertDone:@"没找到原车图层，点「调试：查车视图」看看"]; return; }
+
+    CGSize isz = self.originalCarImage.size;
+    if (isz.width < 1 || isz.height < 1) isz = v.bounds.size;
+    CGSize sc = CGSizeMake(1, 1);
+    CGPoint off = CGPointZero;
+    [self adjustMappingFor:v imageSize:isz scale:&sc offset:&off];
+    self.adjustScale = sc;
+    self.adjustOffset = off;
+    self.adjustRefFrame = v.frame;
+    self.adjustImageSize = isz;
+
     if (!self.adjustView) {
         self.adjustView = [UIImageView new];
         self.adjustView.contentMode = UIViewContentModeScaleAspectFit;
     }
-    NSString *p = [self storedPathForSlot:@"veh"];
-    self.adjustView.image = [UIImage imageWithContentsOfFile:p];
-    self.adjustView.frame = [self vehicleRectInSize:host.bounds.size];
+    self.adjustView.image = [UIImage imageWithContentsOfFile:[self storedPathForSlot:@"veh"]];
+    CGRect ir = [self vehicleRectInSize:isz];      // 图像坐标
+    self.adjustView.frame = CGRectOffset(
+        CGRectMake(ir.origin.x * sc.width + off.x, ir.origin.y * sc.height + off.y,
+                   ir.size.width * sc.width, ir.size.height * sc.height),
+        v.frame.origin.x, v.frame.origin.y);
     self.adjustView.userInteractionEnabled = YES;
     self.adjustView.layer.borderWidth = 1.5;
     self.adjustView.layer.borderColor = [UIColor systemBlueColor].CGColor;
@@ -1000,12 +1033,12 @@ static void NBFillRectWithBand(CGContextRef c, UIImage *src, CGRect rect, CGSize
     [self.adjustView addGestureRecognizer:self.adjustPan];
     [self.adjustView addGestureRecognizer:self.adjustPinch];
 
-    [host addSubview:self.adjustView];
+    [v.superview addSubview:self.adjustView];
     self.adjustTarget = target;
     [self.ballButton setTitle:@"✓" forState:UIControlStateNormal];
     [self unhideBall];
-    NBLOG(@"[微调] 进入 frame=%@ host=%@", NSStringFromCGRect(self.adjustView.frame),
-          NSStringFromClass([host class]));
+    NBLOG(@"[微调] 进入 frame=%@ host=%@ imgSize=%@", NSStringFromCGRect(self.adjustView.frame),
+          NSStringFromClass([v.superview class]), NSStringFromCGSize(isz));
 }
 
 - (void)adjustPanned:(UIPanGestureRecognizer *)g {
@@ -1034,20 +1067,48 @@ static void NBFillRectWithBand(CGContextRef c, UIImage *src, CGRect rect, CGSize
     }
 }
 
+// 原车图坐标 -> 车视图 bounds 坐标 的换算参数（按 contentMode 复刻排版）
+- (void)adjustMappingFor:(UIView *)v imageSize:(CGSize)isz
+                   scale:(CGSize *)outScale offset:(CGPoint *)outOffset {
+    CGSize bs = v.bounds.size;
+    UIViewContentMode m = UIViewContentModeScaleAspectFit;
+    if ([v isKindOfClass:[UIImageView class]]) m = ((UIImageView *)v).contentMode;
+    CGFloat sx = 1.0, sy = 1.0;
+    CGFloat iw = MAX(1.0, isz.width), ih = MAX(1.0, isz.height);
+    if (m == UIViewContentModeScaleToFill) {
+        sx = bs.width / iw;
+        sy = bs.height / ih;
+    } else if (m == UIViewContentModeScaleAspectFit || m == UIViewContentModeScaleAspectFill) {
+        CGFloat s = (m == UIViewContentModeScaleAspectFit)
+                    ? MIN(bs.width / iw, bs.height / ih)
+                    : MAX(bs.width / iw, bs.height / ih);
+        sx = sy = s;
+    }
+    if (outScale) *outScale = CGSizeMake(sx, sy);
+    if (outOffset) *outOffset = CGPointMake((bs.width - isz.width * sx) / 2.0,
+                                            (bs.height - isz.height * sy) / 2.0);
+}
+
 - (void)finishAdjust {
-    UIView *v = self.adjustView;
-    UIView *host = v.superview;
-    if (v && host) {
-        CGFloat W = host.bounds.size.width, H = host.bounds.size.height;
-        if (W > 1 && H > 1) {
-            CGRect f = v.frame;
+    UIView *av = self.adjustView;
+    if (av) {
+        CGRect local = CGRectOffset(av.frame, -self.adjustRefFrame.origin.x, -self.adjustRefFrame.origin.y);
+        CGFloat sx = (self.adjustScale.width  > 0.0001) ? self.adjustScale.width  : 1.0;
+        CGFloat sy = (self.adjustScale.height > 0.0001) ? self.adjustScale.height : 1.0;
+        CGSize isz = self.adjustImageSize;
+        if (isz.width < 1 || isz.height < 1) isz = local.size;
+        CGRect ir = CGRectMake((local.origin.x - self.adjustOffset.x) / sx,
+                               (local.origin.y - self.adjustOffset.y) / sy,
+                               local.size.width / sx, local.size.height / sy);
+        if (isz.width >= 1 && isz.height >= 1) {
             NSString *rect = [NSString stringWithFormat:@"%.4f,%.4f,%.4f,%.4f",
-                              f.origin.x / W, f.origin.y / H, f.size.width / W, f.size.height / H];
+                              ir.origin.x / isz.width, ir.origin.y / isz.height,
+                              ir.size.width / isz.width, ir.size.height / isz.height];
             [[NSUserDefaults standardUserDefaults] setObject:rect forKey:kKeyVehRect];
-            NBLOG(@"[微调] 保存 rect=%@", rect);
+            NBLOG(@"[微调] 保存 rect=%@ (image=%@)", rect, NSStringFromCGSize(isz));
         }
     }
-    [v removeFromSuperview];
+    [av removeFromSuperview];
     self.adjustTarget = nil;
     [self.ballButton setTitle:@"🛴" forState:UIControlStateNormal];
     self.vehicleOverlayImage = nil;
