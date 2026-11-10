@@ -642,6 +642,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 @property (strong, nonatomic) UIPanGestureRecognizer *adjustPan;
 @property (strong, nonatomic) UIPinchGestureRecognizer *adjustPinch;
 @property (strong, nonatomic) NSTimer *watchdog;
+@property (assign, nonatomic) NSTimeInterval lastVideoRestart;   // 重播防抖
 @end
 
 @implementation NBManager
@@ -777,13 +778,15 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
         if (!car.hidden && self.carStateSaved) car.hidden = YES;
     }
 
-    // 背景视频：层被摘了就重挂，播放停了就续上
+    // 背景视频：层被摘了就重挂；播到结尾就 seek 回开头重播；只是暂停就续上
     if (self.bgLayer) {
         UIImageView *sv = self.stageView;
         if (sv && sv.superview) {
             if (self.bgLayer.superlayer != sv.superview.layer) {
                 NBLOG(@"[看门狗] 视频层掉了，重挂");
                 [self applyVideoLayer];
+            } else if ([self bgVideoAtEnd]) {
+                [self restartBgVideo];
             } else if (self.bgPlayer.rate == 0.0) {
                 [self.bgPlayer play];
             }
@@ -1685,6 +1688,10 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
         AVPlayerItem *item = [(id)playerItemCls playerItemWithURL:[NSURL fileURLWithPath:vpath]];
         AVPlayer *p = [(id)playerCls playerWithPlayerItem:item];
         p.muted = YES;
+        // 播完不要自动暂停（AVPlayerActionAtItemEndNone = 2），否则停在最后一帧不动。
+        // 用 KVC 设置，避免 Theos SDK 头文件里缺这个枚举类型。
+        @try { [p setValue:@(2) forKey:@"actionAtItemEnd"]; }
+        @catch (NSException *e) { NBLOG(@"[视频] 设置 actionAtItemEnd 失败 %@", e.reason); }
         self.bgPlayer = p;
         self.bgLayer = [(id)playerLayerCls playerLayerWithPlayer:p];
         self.bgLayer.videoGravity = (NSString *)@"AVLayerVideoGravityResizeAspectFill";
@@ -1705,13 +1712,35 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 }
 
 // 播完 seek 回开头，实现无缝续播（不用 AVPlayerLooper：这个 Theos SDK 里没有它的声明）
-- (void)bgVideoDidEnd {
+- (void)restartBgVideo {
     if (!self.bgPlayer) return;
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - self.lastVideoRestart < 0.25) return;   // 通知和看门狗可能同时到，防抖
+    self.lastVideoRestart = now;
     CMTime z = NBCMZero();
     [self.bgPlayer seekToTime:z
               toleranceBefore:z
                toleranceAfter:z];
     [self.bgPlayer play];
+    NBLOG(@"[视频] 重播");
+}
+
+- (void)bgVideoDidEnd {
+    [self restartBgVideo];
+}
+
+// 是否已播到结尾。⚠️ 不依赖 CMTimeFlags（某些视频的 duration flags 不带 Valid 位，
+// 之前按 flags 判断会永远为假 → 不循环）。只要 timescale 有效就按秒数比。
+- (BOOL)bgVideoAtEnd {
+    AVPlayer *p = self.bgPlayer;
+    if (!p || !p.currentItem) return NO;
+    CMTime cur = p.currentTime;
+    CMTime dur = p.currentItem.duration;
+    if (dur.timescale <= 0 || cur.timescale <= 0) return NO;
+    double ds = (double)dur.value / (double)dur.timescale;
+    double cs = (double)cur.value / (double)cur.timescale;
+    if (ds <= 0.01 || !isfinite(ds) || !isfinite(cs)) return NO;
+    return cs >= ds - 0.12;
 }
 
 // 选一段视频（mp4/mov），拷到沙盒，循环静音播放
