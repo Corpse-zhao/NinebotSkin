@@ -8,7 +8,7 @@
 #import <stdlib.h>
 
 // ============================================================
-// NinebotSkin v0.1.11 —— 九号出行 车辆图/背景图替换（图片版）
+// NinebotSkin v0.1.12 —— 九号出行 车辆图/背景图替换（图片版）
 // 注入目标: cn.ninebot.segway
 //
 // 真机 viewtree(4) 把结构钉死了:
@@ -346,6 +346,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 @property (assign, nonatomic) UIViewContentMode originalStageContentMode;
 @property (strong, nonatomic) UIImage *stageImage;          // 我们给舞台设置的背景图
 @property (copy,   nonatomic) NSString *bgStamp;             // 渲染这张背景时用的文件指纹
+@property (assign, nonatomic) BOOL pendingStageRestore;      // 点了"恢复背景"但当时不在车控页
 
 // 车：原车视图（只用来定位 / 当挂载点）+ 我们贴上去的车辆图层
 @property (weak,   nonatomic) UIView *carView;             // 爱车按钮里的那个 UIImageView
@@ -430,6 +431,15 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 }
 
 - (void)watchdogTick {
+    // 有"待还原"时，即使已经没有替换内容也要继续跑，否则背景会一直卡在合成图上
+    if (self.pendingStageRestore) {
+        UIImageView *s = self.stageView ?: [self findStageImageView];
+        if (s) {
+            NBLOG(@"[看门狗] 发现待还原的背景，补做");
+            [self applyOverlays];
+            return;
+        }
+    }
     if (![self hasAnyReplacement]) return;
 
     // 舞台图还在就用缓存的那个，不要每 0.2s 扫一遍整棵视图树
@@ -820,13 +830,22 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 
 - (void)restoreStage {
     UIImageView *stage = self.stageView ?: [self findStageImageView];
-    if (stage && self.stageImage && stage.image == self.stageImage) {
+    if (!stage) {
+        // 不在车控页（舞台图根本没挂出来）-> 别清状态，等回到车控页再还
+        NBLOG(@"[舞台] 暂时找不到舞台图，待还原（回车控页自动完成）");
+        self.pendingStageRestore = YES;
+        return;
+    }
+    if (self.stageImage && stage.image == self.stageImage) {
         if (self.originalStageImage) stage.image = self.originalStageImage;
         if (self.contentModeCaptured) stage.contentMode = self.originalStageContentMode;
         NBLOG(@"[舞台] 已还原原图");
+    } else if (self.stageImage) {
+        NBLOG(@"[舞台] 舞台图已被 App 换掉，不用我还");
     }
     self.stageImage = nil;
     self.bgStamp = nil;
+    self.pendingStageRestore = NO;
 }
 
 - (void)applyOverlays {
@@ -878,7 +897,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
                 if (self.contentModeCaptured) stage.contentMode = self.originalStageContentMode;
             }
         }
-    } else if (!bgImg && self.stageImage) {
+    } else if (!bgImg && (self.stageImage || self.pendingStageRestore)) {
         [self restoreStage];
     }
 
@@ -1086,6 +1105,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:kKeyVehPath];
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:kKeyVehRect];
     [self applyOverlays];                    // veh 路径没了 -> applyOverlays 里会还原车图
+    [self scheduleReapply];                  // 万一此刻不在车控页，回到首页时再兜一次
     if (![self hasAnyReplacement]) [self restoreOriginalStage];
     [self alertDone:@"已恢复车辆原图"];
     NBLOG(@"[恢复] 车辆图");
@@ -1094,8 +1114,12 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 - (void)restoreBackground {
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:kKeyBgPath];
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:kKeyBgRect];
-    self.stageImage = nil;
+    // 注意：这里**不能**先把 self.stageImage 清掉。
+    // applyOverlays 靠「bgImg 为空 && stageImage 非空」才走 restoreStage，
+    // 提前清空会让还原分支永远不成立 —— 之前"恢复背景要重启"就是这么来的。
+    self.pendingStageRestore = YES;          // 不在车控页时，回车控页由看门狗补还原
     [self applyOverlays];
+    [self scheduleReapply];
     if (![self hasAnyReplacement]) [self restoreOriginalStage];
     [self alertDone:@"已恢复背景原图"];
     NBLOG(@"[恢复] 背景");
