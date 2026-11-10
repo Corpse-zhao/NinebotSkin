@@ -8,7 +8,7 @@
 #import <stdlib.h>
 
 // ============================================================
-// NinebotSkin v0.1.12 —— 九号出行 车辆图/背景图替换（图片版）
+// NinebotSkin v0.1.13 —— 九号出行 车辆图/背景图替换（图片版）
 // 注入目标: cn.ninebot.segway
 //
 // 真机 viewtree(4) 把结构钉死了:
@@ -35,7 +35,13 @@ static NSString * const kTargetBundle = @"cn.ninebot.segway";
 static NSString * const kKeyBgPath    = @"nbskin_bg_path";
 static NSString * const kKeyVehPath   = @"nbskin_veh_path";
 static NSString * const kKeyVehRect   = @"nbskin_veh_rect"; // 相对「原车视图 frame」的比例
-static NSString * const kKeyBgRect    = @"nbskin_bg_rect";
+static NSString * const kKeyBgRect    = @"nbskin_bg_rect";  // 背景绘制区域（相对舞台）
+static NSString * const kKeyBgMode    = @"nbskin_bg_mode";  // 0=整个上半屏 1=车控区域
+static NSString * const kKeyBgSrcPath = @"nbskin_bg_src";   // 裁剪前的原图（再次裁剪用）
+
+// 「车控区域」的上边界（相对舞台高度）。
+// 舞台高 441.47；cell 内容区从 y=103 起（「车控」标题那一行）→ 103 / 441.47 ≈ 0.2333
+static CGFloat const kBgRegionTop = 0.2333;
 
 // ---------- 日志 ----------
 static NSString *NBLogDir(void) {
@@ -308,6 +314,20 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
     }
 }
 
+// 把任意方向的图「正立化」成 scale=1 的位图，这样像素坐标 == pt 坐标，裁剪才好算
+static UIImage *NBNormalizedImage(UIImage *img) {
+    if (!img) return nil;
+    CGSize s = img.size;
+    if (s.width < 1 || s.height < 1) return nil;
+    UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat defaultFormat];
+    f.scale = 1.0;
+    f.opaque = NO;
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:s format:f];
+    return [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        [img drawInRect:CGRectMake(0, 0, s.width, s.height)];
+    }];
+}
+
 // ---------- 悬浮球独立的穿透窗口 ----------
 @interface NBPassThroughWindow : UIWindow
 @end
@@ -334,6 +354,207 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     }
     if (gNBOrigSetHidden) ((void (*)(id, SEL, BOOL))gNBOrigSetHidden)(self, _cmd, hidden);
 }
+
+// ---------- 背景裁剪页 ----------
+// 固定裁剪框 + 可拖动/双指缩放的图片（UIScrollView 的标准做法）。
+// 框的宽高比 = 当前显示方式的目标区域比例，所以裁完铺进去正好，不会再被二次裁掉。
+@interface NBCropViewController : UIViewController <UIScrollViewDelegate> {
+    UIImage *_source;
+    CGFloat _aspect;
+    UIScrollView *_scroll;
+    UIImageView *_iv;
+    CGSize _cropSize;
+    CGFloat _baseScale;
+    BOOL _centered;
+}
+@property (copy, nonatomic) void (^onFinish)(UIImage *img);
+@property (copy, nonatomic) void (^onCancel)(void);
+- (instancetype)initWithImage:(UIImage *)img aspect:(CGFloat)aspect;
+@end
+
+@implementation NBCropViewController
+
+- (instancetype)initWithImage:(UIImage *)img aspect:(CGFloat)aspect {
+    self = [super init];
+    if (self) {
+        _source = img;
+        _aspect = (aspect > 0.05) ? aspect : 1.0;
+        self.modalPresentationStyle = UIModalPresentationFullScreen;
+    }
+    return self;
+}
+
+- (UILabel *)nbLabel:(NSString *)text size:(CGFloat)size bold:(BOOL)bold {
+    UILabel *l = [UILabel new];
+    l.text = text;
+    l.textColor = [UIColor whiteColor];
+    l.font = bold ? [UIFont boldSystemFontOfSize:size] : [UIFont systemFontOfSize:size];
+    [l sizeToFit];
+    return l;
+}
+
+- (UIButton *)nbButton:(NSString *)title size:(CGFloat)size bold:(BOOL)bold {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    [b setTitle:title forState:UIControlStateNormal];
+    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    b.titleLabel.font = bold ? [UIFont boldSystemFontOfSize:size] : [UIFont systemFontOfSize:size];
+    [b sizeToFit];
+    CGRect f = b.frame;
+    f.size.width = MAX(f.size.width, 64.0);
+    f.size.height = MAX(f.size.height, 44.0);
+    b.frame = f;
+    return b;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [UIColor blackColor];
+    CGSize vb = self.view.bounds.size;
+    CGFloat topBar = 92.0, bottomBar = 96.0;
+
+    // ---- 裁剪框尺寸：先按可用宽度，太高就按可用高度反算 ----
+    CGFloat availW = vb.width - 24.0;
+    CGFloat availH = vb.height - topBar - bottomBar;
+    CGFloat w = availW, h = w / _aspect;
+    if (h > availH) { h = availH; w = h * _aspect; }
+    _cropSize = CGSizeMake(floor(w), floor(h));
+    CGRect cropFrame = CGRectMake(floor((vb.width - _cropSize.width) / 2.0),
+                                  floor(topBar + (availH - _cropSize.height) / 2.0),
+                                  _cropSize.width, _cropSize.height);
+
+    // ---- 图片 ----
+    CGSize is = _source.size;
+    if (is.width < 1 || is.height < 1) is = CGSizeMake(1, 1);
+    _baseScale = MAX(_cropSize.width / is.width, _cropSize.height / is.height);
+
+    _scroll = [[UIScrollView alloc] initWithFrame:cropFrame];
+    _scroll.backgroundColor = [UIColor colorWithWhite:0.16 alpha:1.0];
+    _scroll.showsHorizontalScrollIndicator = NO;
+    _scroll.showsVerticalScrollIndicator = NO;
+    _scroll.bouncesZoom = YES;
+    _scroll.decelerationRate = UIScrollViewDecelerationRateFast;
+    _scroll.delegate = self;
+    _scroll.clipsToBounds = YES;
+    // 不让安全区自动改 contentInset，否则 contentOffset 会偏，裁出来的位置会歪
+    _scroll.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+    [self.view addSubview:_scroll];
+
+    _iv = [[UIImageView alloc] initWithImage:_source];
+    _iv.frame = CGRectMake(0, 0, is.width * _baseScale, is.height * _baseScale);
+    _iv.contentMode = UIViewContentModeScaleToFill;   // frame 已按原比例算好
+    [_scroll addSubview:_iv];
+    _scroll.contentSize = _iv.frame.size;
+    _scroll.minimumZoomScale = 1.0;
+    _scroll.maximumZoomScale = 5.0;
+
+    // ---- 框外遮暗 ----
+    UIColor *mask = [UIColor colorWithWhite:0.0 alpha:0.72];
+    UIView *maskTop = [[UIView alloc] initWithFrame:CGRectMake(0, 0, vb.width, cropFrame.origin.y)];
+    UIView *maskBottom = [[UIView alloc] initWithFrame:CGRectMake(0, CGRectGetMaxY(cropFrame),
+                                                                 vb.width, vb.height - CGRectGetMaxY(cropFrame))];
+    UIView *maskLeft = [[UIView alloc] initWithFrame:CGRectMake(0, cropFrame.origin.y,
+                                                               cropFrame.origin.x, cropFrame.size.height)];
+    UIView *maskRight = [[UIView alloc] initWithFrame:CGRectMake(CGRectGetMaxX(cropFrame), cropFrame.origin.y,
+                                                                vb.width - CGRectGetMaxX(cropFrame), cropFrame.size.height)];
+    NSArray<UIView *> *masks = @[maskTop, maskBottom, maskLeft, maskRight];
+    for (UIView *mv in masks) {
+        mv.backgroundColor = mask;
+        mv.userInteractionEnabled = NO;
+        [self.view addSubview:mv];
+    }
+    // 画个白框，让边界清楚
+    UIView *border = [[UIView alloc] initWithFrame:cropFrame];
+    border.layer.borderWidth = 1.0;
+    border.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.9].CGColor;
+    border.userInteractionEnabled = NO;
+    [self.view addSubview:border];
+
+    // ---- 顶部按钮 ----
+    UIButton *cancel = [self nbButton:@"取消" size:17.0 bold:NO];
+    cancel.frame = CGRectMake(12.0, 46.0, cancel.frame.size.width, 44.0);
+    [cancel addTarget:self action:@selector(tapCancel) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:cancel];
+
+    UIButton *done = [self nbButton:@"完成" size:17.0 bold:YES];
+    done.frame = CGRectMake(vb.width - done.frame.size.width - 12.0, 46.0, done.frame.size.width, 44.0);
+    [done addTarget:self action:@selector(tapDone) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:done];
+
+    UILabel *title = [self nbLabel:@"裁剪背景图" size:17.0 bold:YES];
+    title.center = CGPointMake(vb.width / 2.0, 68.0);
+    [self.view addSubview:title];
+
+    // ---- 底部提示 + 重置 ----
+    UILabel *hint = [self nbLabel:@"拖动移动 · 双指缩放" size:13.0 bold:NO];
+    hint.textColor = [UIColor colorWithWhite:1.0 alpha:0.6];
+    hint.center = CGPointMake(vb.width / 2.0, CGRectGetMaxY(cropFrame) + 28.0);
+    [self.view addSubview:hint];
+
+    UIButton *reset = [self nbButton:@"重置" size:15.0 bold:NO];
+    reset.center = CGPointMake(vb.width / 2.0, CGRectGetMaxY(cropFrame) + 66.0);
+    [reset addTarget:self action:@selector(tapReset) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:reset];
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    if (_centered || !_scroll) return;
+    _centered = YES;
+    [self centerImage];
+}
+
+- (void)centerImage {
+    if (!_scroll || !_iv) return;
+    _scroll.zoomScale = 1.0;
+    CGSize cs = _scroll.contentSize;
+    CGFloat ox = MAX(0.0, (cs.width - _cropSize.width) / 2.0);
+    CGFloat oy = MAX(0.0, (cs.height - _cropSize.height) / 2.0);
+    _scroll.contentOffset = CGPointMake(ox, oy);
+}
+
+- (void)tapReset {
+    [self centerImage];
+}
+
+- (UIView *)viewForZoomingInScrollView:(UIScrollView *)sv {
+    return _iv;
+}
+
+- (void)tapCancel {
+    if (self.onCancel) self.onCancel();
+}
+
+- (void)tapDone {
+    UIImage *out = [self croppedImage];
+    if (!out) {
+        // 裁不出来就把原图交回去，别让用户卡在这一页
+        out = NBNormalizedImage(_source);
+    }
+    if (self.onFinish) self.onFinish(out);
+}
+
+- (UIImage *)croppedImage {
+    if (!_scroll || !_iv) return nil;
+    CGFloat s = _baseScale * _scroll.zoomScale;      // 原图 pt -> 内容 pt
+    if (s <= 0.0001) return nil;
+    CGPoint o = _scroll.contentOffset;
+    CGRect r = CGRectMake(o.x / s, o.y / s, _cropSize.width / s, _cropSize.height / s);
+
+    UIImage *flat = NBNormalizedImage(_source);      // 正立、scale=1 -> 像素坐标
+    if (!flat) return nil;
+    CGSize fs = flat.size;
+    r = CGRectIntersection(r, CGRectMake(0, 0, fs.width, fs.height));
+    if (CGRectIsNull(r) || r.size.width < 1.0 || r.size.height < 1.0) return nil;
+    CGImageRef cg = CGImageCreateWithImageInRect(flat.CGImage, r);
+    if (!cg) return nil;
+    UIImage *out = [UIImage imageWithCGImage:cg scale:1.0 orientation:UIImageOrientationUp];
+    CGImageRelease(cg);
+    NBLOG(@"[裁剪] 源 %@ -> 取 %@ -> %@", NSStringFromCGSize(fs), NSStringFromCGRect(r),
+          NSStringFromCGSize(out.size));
+    return out;
+}
+
+@end
 
 @interface NBManager () <PHPickerViewControllerDelegate>
 @property (strong, nonatomic) UIWindow *ballWindow;
@@ -552,24 +773,31 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"九号换装"
                                                                 message:nil
                                                          preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak NBManager *weakSelf = self;
     [ac addAction:[UIAlertAction actionWithTitle:@"替换【车辆图片】" style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *action){ [self pickImageFor:@"veh"]; }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"替换【背景图片】（ninebot 区域）" style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *action){ [self pickImageFor:@"bg"]; }]];
+                                         handler:^(UIAlertAction *action){ [weakSelf pickImageFor:@"veh"]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"替换【背景图片】（选图后可裁剪）" style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *action){ [weakSelf pickImageFor:@"bg"]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"重新裁剪背景图" style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *action){ [weakSelf recropBackground]; }]];
+    NSString *modeName = ([self bgMode] == 0) ? @"整个上半屏" : @"车控区域";
+    [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"背景显示方式（%@）", modeName]
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *action){ [weakSelf chooseBgMode]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"微调车辆图（拖动/双指缩放）" style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *action){ [self beginAdjust:@"veh"]; }]];
+                                         handler:^(UIAlertAction *action){ [weakSelf beginAdjust:@"veh"]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"车辆图对准原车（重置位置）" style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *action){ [self resetVehicleRect]; }]];
+                                         handler:^(UIAlertAction *action){ [weakSelf resetVehicleRect]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"恢复车辆原图" style:UIAlertActionStyleDestructive
-                                         handler:^(UIAlertAction *action){ [self restoreVehicle]; }]];
+                                         handler:^(UIAlertAction *action){ [weakSelf restoreVehicle]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"恢复背景原图" style:UIAlertActionStyleDestructive
-                                         handler:^(UIAlertAction *action){ [self restoreBackground]; }]];
+                                         handler:^(UIAlertAction *action){ [weakSelf restoreBackground]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"调试：导出视图树" style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *action){ [self dumpViewTree]; }]];
+                                         handler:^(UIAlertAction *action){ [weakSelf dumpViewTree]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"调试：查车视图" style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *action){ [self listCarViews]; }]];
+                                         handler:^(UIAlertAction *action){ [weakSelf listCarViews]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel
-                                         handler:^(UIAlertAction *action){ [self unhideBall]; }]];
+                                         handler:^(UIAlertAction *action){ [weakSelf unhideBall]; }]];
 
     if (ac.popoverPresentationController) {
         ac.popoverPresentationController.sourceView = self.ballButton ?: top.view;
@@ -687,8 +915,35 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 #pragma mark - 舞台图（只负责背景）
 // 背景就是「把舞台图自己的 image 换成一张新合成的图」—— v0.1.5 起一直有效。
 // 白底打底 + aspectFill，保证任何比例的图都铺满、不留白块。
+- (NSInteger)bgMode {
+    return [[NSUserDefaults standardUserDefaults] integerForKey:kKeyBgMode];
+}
+
+// 背景要铺在舞台的哪块区域。
+// 模式 0：整张舞台图（0 ~ 441.47），也就是"上半部分全部显示"
+// 模式 1："车控区域"——从「车控」标题那一行（舞台 y≈0.233）一直到底。
+//         上面状态栏/消息卡片那一段保持 App 原样，不会被背景染色。
+- (CGRect)bgRegionInSize:(CGSize)sz {
+    if ([self bgMode] == 0) return CGRectMake(0, 0, sz.width, sz.height);
+    NSString *raw = [[NSUserDefaults standardUserDefaults] stringForKey:kKeyBgRect];
+    CGRect n;
+    if (raw.length) n = NBParseNormalizedRect(raw);
+    else n = CGRectMake(0, kBgRegionTop, 1, 1.0 - kBgRegionTop);
+    if (n.size.width <= 0.02 || n.size.height <= 0.02)
+        n = CGRectMake(0, kBgRegionTop, 1, 1.0 - kBgRegionTop);
+    return CGRectMake(n.origin.x * sz.width, n.origin.y * sz.height,
+                      n.size.width * sz.width, n.size.height * sz.height);
+}
+
 - (UIImage *)renderStageImage:(CGSize)sz bg:(UIImage *)bg {
     if (sz.width < 1 || sz.height < 1 || !bg) return nil;
+    CGRect full = CGRectMake(0, 0, sz.width, sz.height);
+    CGRect region = [self bgRegionInSize:sz];
+    BOOL whole = (CGRectGetMinX(region) <= 0.5 && CGRectGetMinY(region) <= 0.5 &&
+                  fabs(CGRectGetWidth(region) - sz.width) < 0.5 &&
+                  fabs(CGRectGetHeight(region) - sz.height) < 0.5);
+    UIImage *orig = self.originalStageImage;
+
     UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
     fmt.opaque = YES;
     fmt.scale = 3.0;
@@ -696,10 +951,14 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     UIImage *out = [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
         CGContextRef c = ctx.CGContext;
         [[UIColor whiteColor] setFill];
-        CGContextFillRect(c, CGRectMake(0, 0, sz.width, sz.height));
-        NBDrawImage(c, bg, CGRectMake(0, 0, sz.width, sz.height), YES);
+        CGContextFillRect(c, full);
+        // 只铺一块时，区域外要保留原舞台图的样子，
+        // 否则上面会多出一条纯色带（原图是渐变时特别明显）
+        if (!whole && orig) NBDrawImage(c, orig, full, YES);
+        NBDrawImage(c, bg, region, YES);
     }];
-    NBLOG(@"[合成] 舞台 %@ 背景 %@", NSStringFromCGSize(sz), NSStringFromCGSize(bg.size));
+    NBLOG(@"[合成] 舞台 %@ 背景 %@ 模式%ld 区域 %@", NSStringFromCGSize(sz), NSStringFromCGSize(bg.size),
+          (long)[self bgMode], NSStringFromCGRect(region));
     return out;
 }
 
@@ -884,7 +1143,8 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     //    判断依据是「文件指纹 + image 还是不是我上次设的那张」，
     //    只看指针会漏掉「同一个文件名换了内容」的情况。
     if (stage && bgImg) {
-        NSString *stamp = [self stampForPath:bgPath];
+        NSString *stamp = [NSString stringWithFormat:@"%@|%ld",
+                           [self stampForPath:bgPath], (long)[self bgMode]];
         BOOL same = (self.stageImage != nil) && (stage.image == self.stageImage) &&
                     (stamp != nil) && (self.bgStamp != nil) && [self.bgStamp isEqualToString:stamp];
         if (!same) {
@@ -959,8 +1219,9 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
         BOOL ok = NO;
         NSString *savedPath = nil;
         if (png.length) {
-            NSString *path = [NBLogDir() stringByAppendingPathComponent:
-                              [NSString stringWithFormat:@"%@.png", slot]];
+            // 背景存成 bg_src.png（裁剪前的原图），车辆仍然是 veh.png
+            NSString *name = isVeh ? @"veh.png" : @"bg_src.png";
+            NSString *path = [NBLogDir() stringByAppendingPathComponent:name];
             ok = [png writeToFile:path atomically:YES];
             savedPath = path;
         }
@@ -969,20 +1230,24 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
               px.width, px.height, (int)stripped, trim * 100.0, (int)ok);
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (ok) {
-                NSString *key = isVeh ? kKeyVehPath : kKeyBgPath;
-                [[NSUserDefaults standardUserDefaults] setObject:savedPath forKey:key];
+            if (!ok) {
+                [self alertDone:@"图片解析失败（格式特殊），请换一张"];
+                return;
+            }
+            if (isVeh) {
+                [[NSUserDefaults standardUserDefaults] setObject:savedPath forKey:kKeyVehPath];
                 [self applyOverlays];
                 [self scheduleReapply];
-                NSString *label = isVeh ? @"车辆图片" : @"背景图片";
                 NSMutableString *note = [NSMutableString string];
                 if (stripped) [note appendString:@"（已自动去掉白底）"];
                 if (trim > 0.05) [note appendFormat:@"（已裁掉周围 %.0f%% 空白）", trim * 100.0];
-                if (isVeh) [note appendString:@"\n位置/大小不对就点悬浮球 → 微调车辆图"];
-                [self alertDone:[NSString stringWithFormat:@"已替换%@\n%@×%@ px%@",
-                                 label, @((NSInteger)px.width), @((NSInteger)px.height), note]];
+                [note appendString:@"\n位置/大小不对就点悬浮球 → 微调车辆图"];
+                [self alertDone:[NSString stringWithFormat:@"已替换车辆图片\n%@×%@ px%@",
+                                 @((NSInteger)px.width), @((NSInteger)px.height), note]];
             } else {
-                [self alertDone:@"图片解析失败（格式特殊），请换一张"];
+                // 背景：原图先存好（裁剪还能反悔），再进裁剪页取景
+                [[NSUserDefaults standardUserDefaults] setObject:savedPath forKey:kKeyBgSrcPath];
+                [self openCropWithSourcePath:savedPath];
             }
         });
     });
@@ -997,6 +1262,122 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *action){ [self unhideBall]; }]];
     [top presentViewController:ac animated:YES completion:nil];
+}
+
+#pragma mark - 背景裁剪 / 显示方式
+
+// 当前显示方式对应的目标区域宽高比（裁剪框就用这个比例，裁完正好铺满）
+- (CGFloat)bgRegionAspect {
+    UIImageView *stage = self.stageView ?: [self findStageImageView];
+    CGSize sz = stage ? stage.bounds.size : CGSizeMake(430.0, 441.47);
+    if (sz.width < 1 || sz.height < 1) sz = CGSizeMake(430.0, 441.47);
+    CGRect r = [self bgRegionInSize:sz];
+    if (r.size.height < 1) return sz.width / sz.height;
+    return r.size.width / r.size.height;
+}
+
+- (void)openCropWithSourcePath:(NSString *)path {
+    UIImage *src = [UIImage imageWithContentsOfFile:path];
+    if (!src) { [self alertDone:@"图片读取失败，请换一张"]; return; }
+    CGFloat aspect = [self bgRegionAspect];
+    __weak NBManager *weakSelf = self;
+    // picker 刚 dismiss，等转场结束再 present，否则会冲突
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        NBManager *me = weakSelf;
+        if (!me) return;
+        NBCropViewController *vc = [[NBCropViewController alloc] initWithImage:src aspect:aspect];
+        // vc 强持有 block，block 里不能再强持有 vc（会循环引用）
+        __weak NBCropViewController *weakVC = vc;
+        vc.onCancel = ^{
+            NBCropViewController *strongVC = weakVC;
+            if (strongVC) [me dismissCropVC:strongVC];
+        };
+        vc.onFinish = ^(UIImage *img) {
+            NBCropViewController *strongVC = weakVC;
+            if (strongVC) [me finishCropVC:strongVC image:img];
+        };
+        [me presentTracked:vc];
+        NBLOG(@"[裁剪] 打开裁剪页 aspect=%.3f", aspect);
+    });
+}
+
+- (void)dismissCropVC:(UIViewController *)vc {
+    [vc dismissViewControllerAnimated:YES completion:^{ [self unhideBall]; }];
+}
+
+- (void)finishCropVC:(UIViewController *)vc image:(UIImage *)img {
+    __weak NBManager *weakSelf = self;
+    [vc dismissViewControllerAnimated:YES completion:^{
+        [weakSelf commitBackgroundImage:img];
+    }];
+}
+
+- (void)commitBackgroundImage:(UIImage *)img {
+    if (!img) { [self alertDone:@"裁剪失败，请换一张图"]; return; }
+    NSData *png = NBEncodePNG(img.CGImage);
+    if (!png.length) { [self alertDone:@"裁剪结果编码失败，请换一张图"]; return; }
+    NSString *path = [NBLogDir() stringByAppendingPathComponent:@"bg.png"];
+    BOOL ok = [png writeToFile:path atomically:YES];
+    NBLOG(@"[裁剪] 写入 %@ %@ ok=%d", NSStringFromCGSize(img.size),
+          [path lastPathComponent], (int)ok);
+    if (!ok) { [self alertDone:@"写文件失败，请检查存储空间"]; return; }
+
+    [[NSUserDefaults standardUserDefaults] setObject:path forKey:kKeyBgPath];
+    self.stageImage = nil;                 // 强制重渲染新背景
+    self.bgStamp = nil;
+    [self applyOverlays];
+    [self scheduleReapply];
+    NSString *modeNote = ([self bgMode] == 0) ? @"整个上半屏" : @"车控区域";
+    [self alertDone:[NSString stringWithFormat:@"背景已应用\n%@×%@ px · %@",
+                     @((NSInteger)img.size.width), @((NSInteger)img.size.height), modeNote]];
+}
+
+// 重新裁剪：用裁剪前的原图重来（没有再退回已应用的图）
+- (void)recropBackground {
+    NSString *src = [[NSUserDefaults standardUserDefaults] stringForKey:kKeyBgSrcPath];
+    if (!src.length || ![[NSFileManager defaultManager] fileExistsAtPath:src]) {
+        src = [self storedPathForSlot:@"bg"];
+    }
+    if (!src.length) { [self alertDone:@"还没有背景图，先点「替换【背景图片】」"]; return; }
+    [self openCropWithSourcePath:src];
+}
+
+- (void)chooseBgMode {
+    UIViewController *top = [self topVC];
+    if (!top) { [self unhideBall]; return; }
+    NSInteger cur = [self bgMode];
+    NSString *title = cur == 0 ? @"背景显示方式（当前：整个上半屏）" : @"背景显示方式（当前：车控区域）";
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
+                                                                message:@"车控区域 = 「车控 / 电量 / 续航 / ninebot / 车」那一块，上面状态栏那段保持原样"
+                                                         preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak NBManager *weakSelf = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"① 整个上半屏（铺到状态栏后面）"
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a){ [weakSelf setBgMode:0]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"② 车控区域（只有车控那一块）"
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a){ [weakSelf setBgMode:1]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel
+                                         handler:^(UIAlertAction *a){ [weakSelf unhideBall]; }]];
+    if (ac.popoverPresentationController) {
+        ac.popoverPresentationController.sourceView = self.ballButton ?: top.view;
+        ac.popoverPresentationController.sourceRect = (self.ballButton ?: top.view).bounds;
+    }
+    [top presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)setBgMode:(NSInteger)mode {
+    [[NSUserDefaults standardUserDefaults] setInteger:mode forKey:kKeyBgMode];
+    self.stageImage = nil;
+    self.bgStamp = nil;
+    [self applyOverlays];
+    [self scheduleReapply];
+    NBLOG(@"[背景] 显示方式 -> %ld", (long)mode);
+    NSString *msg = (mode == 0)
+        ? @"已改为：整个上半屏\n背景会铺到状态栏后面那一整块。\n由于比例变了，建议点「重新裁剪背景图」重新取景。"
+        : @"已改为：车控区域\n只铺「车控」到底这一块，上面保持原样。\n由于比例变了，建议点「重新裁剪背景图」重新取景。";
+    [self alertDone:msg];
 }
 
 #pragma mark - 微调车辆位置
