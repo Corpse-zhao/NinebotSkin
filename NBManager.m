@@ -992,23 +992,26 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 }
 
 // 车辆图层在「原车视图的 superview」里的 frame。
-// 用 carView.frame（不是 bounds）是因为图层和原车是兄弟视图，同一坐标系。
-// 尺寸/位置不可信时返回 CGRectNull，调用方跳过这次布局（别把车图放大或挪走）。
+// 用 convertRect 而不是手拼 v.frame：原车视图可能带 transform / bounds.origin≠0，
+// 手拼会把车图算偏、算大（v0.2.2 车图放大跑位的直接原因之一）。
 - (CGRect)vehicleFrameForCarView:(UIView *)v {
-    if (!v) return CGRectNull;
+    if (!v || !v.superview) return CGRectNull;
     CGSize bs = v.bounds.size;
     if (bs.width < 40.0 || bs.height < 40.0) return CGRectNull;   // 布局还没落位
-    CGRect f = v.frame;
-    UIView *sp = v.superview;
-    if (sp && sp.bounds.size.width > 1.0 && sp.bounds.size.height > 1.0) {
-        // 原车按钮正常约占父视图 64%×43%；接近铺满说明 cell 复用/布局未完成，抓错了
-        if (f.size.width / sp.bounds.size.width > 0.95 &&
-            f.size.height / sp.bounds.size.height > 0.95) return CGRectNull;
-    }
+    CGRect carRect = [v convertRect:v.bounds toView:v.superview]; // 原车在父视图里的真实占位
+    if (CGRectIsNull(carRect) || carRect.size.width < 40.0 || carRect.size.height < 40.0) return CGRectNull;
     CGRect n = [self vehicleNormRect];
-    return CGRectMake(f.origin.x + n.origin.x * bs.width,
-                      f.origin.y + n.origin.y * bs.height,
-                      n.size.width * bs.width, n.size.height * bs.height);
+    CGRect f = CGRectMake(carRect.origin.x + n.origin.x * carRect.size.width,
+                          carRect.origin.y + n.origin.y * carRect.size.height,
+                          n.size.width * carRect.size.width,
+                          n.size.height * carRect.size.height);
+    // 兜底：正常 norm rect ≤ 1，算出来不会超过原车占位。一旦超出 1.6 倍，
+    // 说明缓存的比例数据坏了，直接按原车占位盖住 —— 宁可小一点，也不让车图压到状态文案上。
+    if (f.size.width > carRect.size.width * 1.6 || f.size.height > carRect.size.height * 1.6) {
+        NBLOG(@"[车视图] 比例数据异常(%@)，回退为盖住原车", NSStringFromCGRect(n));
+        return carRect;
+    }
+    return f;
 }
 
 #pragma mark - 舞台图（只负责背景）
@@ -1158,7 +1161,11 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     vv.image = veh;
     CGRect fr = [self vehicleFrameForCarView:v];
     if (!CGRectIsNull(fr)) vv.frame = fr;   // 尺寸不可信时不改，等看门狗下次算对
-    vv.autoresizingMask = v.autoresizingMask;
+    // 关键：**不要继承原车的 autoresizingMask**。
+    // 原车按钮带 flexible 边距，父视图一变（弹窗/全屏页/旋转）系统就会把我们的图层
+    // 一起拉伸放大，而且再也缩不回来 —— 车图突然变大跑位就是这么来的。
+    // 位置交给看门狗每 0.2s 主动跟随，不需要系统帮倒忙。
+    vv.autoresizingMask = UIViewAutoresizingNone;
     if (vv.superview != v.superview) {
         [vv removeFromSuperview];
         [v.superview addSubview:vv];                        // 最上层
