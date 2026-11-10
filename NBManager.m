@@ -683,12 +683,13 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
         [out appendFormat:@"[window] %@ bounds=%@\n", NSStringFromClass([win class]),
          NSStringFromCGRect(win.bounds)];
         UIImageView *stage = [self findStageImageView];
+        NSString *stageCls = stage ? NSStringFromClass([stage class]) : @"nil";
+        NSString *stageFrame = stage ? NSStringFromCGRect(stage.frame) : @"-";
+        NSString *stageImg = (stage && stage.image) ? NSStringFromCGSize(stage.image.size) : @"nil";
+        NSString *compStr = self.compositeImage ? NSStringFromCGSize(self.compositeImage.size) : @"nil";
+        BOOL isOurs = (stage && stage.image && stage.image == self.compositeImage);
         [out appendFormat:@"[stage] %@ frame=%@ img=%@ (ours=%d) composite=%@\n",
-         stage ? NSStringFromClass([stage class]) : @"nil",
-         stage ? NSStringFromCGRect(stage.frame) : @"-",
-         stage ? NSStringFromCGSize(stage.image.size) : CGSizeZero,
-         (int)(stage && stage.image == self.compositeImage),
-         self.compositeImage ? NSStringFromCGSize(self.compositeImage.size) : @"nil"];
+         stageCls, stageFrame, stageImg, (int)isOurs, compStr];
         [self dump:win.rootViewController.view to:out depth:0];
     }
     NSString *path = [NBLogDir() stringByAppendingPathComponent:@"viewtree.txt"];
