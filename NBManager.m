@@ -519,8 +519,9 @@ static void NBLogLine(NSString *line) {
 #pragma mark - 现场微调
 
 - (void)beginAdjust:(NSString *)target {
-    UIView *v = [target isEqualToString:@"bg"] ? self.bgView : self.vehView;
-    if (!v) { [self alertDone:[target isEqualToString:@"bg"] ? @"还没有替换背景图片" : @"还没有替换车辆图片"]; return; }
+    BOOL isBG = [target isEqualToString:@"bg"];
+    UIView *v = isBG ? self.bgView : self.vehView;
+    if (!v) { [self alertDone:isBG ? @"还没有替换背景图片" : @"还没有替换车辆图片"]; return; }
     self.adjustTarget = target;
     v.userInteractionEnabled = YES;
     v.layer.borderWidth = 1.5;
@@ -566,7 +567,8 @@ static void NBLogLine(NSString *line) {
 }
 
 - (void)finishAdjust {
-    UIView *v = [self adjustTarget isEqualToString:@"bg"] ? self.bgView : self.vehView;
+    BOOL isBG = [self.adjustTarget isEqualToString:@"bg"];
+    UIView *v = isBG ? self.bgView : self.vehView;
     UIView *host = v.superview;
     NSString *target = self.adjustTarget ?: @"veh";
     if (v && host) {
@@ -575,8 +577,8 @@ static void NBLogLine(NSString *line) {
             CGRect f = v.frame;
             NSString *rect = [NSString stringWithFormat:@"%.4f,%.4f,%.4f,%.4f",
                               f.origin.x / W, f.origin.y / H, f.size.width / W, f.size.height / H];
-            [[NSUserDefaults standardUserDefaults] setObject:rect
-                                                      forKey:[target isEqualToString:@"bg"] ? kKeyBgRect : kKeyVehRect];
+            NSString *key = isBG ? kKeyBgRect : kKeyVehRect;
+            [[NSUserDefaults standardUserDefaults] setObject:rect forKey:key];
             NBLOG(@"[微调] 保存 %@ = %@", target, rect);
         }
     }
@@ -585,7 +587,7 @@ static void NBLogLine(NSString *line) {
     self.adjustTarget = nil;
     [self.ballButton setTitle:@"🛴" forState:UIControlStateNormal];
     [self applyOverlays];
-    [self alertDone:[target isEqualToString:@"bg"] ? @"背景区域已保存" : @"车辆图位置已保存"];
+    [self alertDone:isBG ? @"背景区域已保存" : @"车辆图位置已保存"];
 }
 
 - (void)resetVehicleRect {
