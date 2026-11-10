@@ -81,7 +81,7 @@ jobs:
           assert control_text, "no control"
           print(control_text)
           assert "iphoneos-arm64e" in control_text, "Architecture 不是 arm64e!"
-          assert "Version: 0.1.0" in control_text, "版本号不对"
+          assert "Version: 0.1.1" in control_text, "版本号不对"
 
           # payload: gz / xz / lzma(alone) 全兼容
           tarbytes = None
@@ -123,7 +123,7 @@ jobs:
           # 关键字 (UTF-8 + UTF-16LE 双编码)
           def has(s):
               return (s.encode("utf-8") in b) or (s.encode("utf-16-le") in b)
-          for kw in ("cn.ninebot.segway", "0.1.0"):
+          for kw in ("cn.ninebot.segway", "0.1.1"):
               assert has(kw), "dylib 缺关键字 " + kw
           print("✅ 产物校验全部通过")
           PY
