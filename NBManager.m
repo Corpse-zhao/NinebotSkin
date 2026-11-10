@@ -9,8 +9,19 @@
 #import <math.h>
 #import <stdlib.h>
 
-// Theos SDK 的 AVFoundation 头文件缺失该通知常量声明，手动补上
-extern NSString *const AVPlayerItemDidPlayToEndTime;
+// 视频/媒体一律走 objc_getClass 运行时取类 + 字符串字面量常量，
+// 不链接 AVFoundation/CoreMedia：dylib 的 LC_LOAD_DYLIB 集合与 v0.1.15 完全一致，
+// 避免个别设备/引导环境下 framework 解析失败导致整个 tweak 静默拒载。
+
+// kCMTimeZero 等价物（不引用 CoreMedia 符号；flags=1 即 kCMTimeFlags_Valid）
+static CMTime NBCMZero(void) {
+    CMTime t;
+    t.value = 0;
+    t.timescale = 1;
+    t.flags = 1;
+    t.epoch = 0;
+    return t;
+}
 
 // ============================================================
 // NinebotSkin v0.2.0 —— 九号出行 车辆图/背景图替换（图片 + 背景视频）
@@ -1645,7 +1656,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 - (void)teardownVideoLayer {
     if (self.bgPlayer) {
         [[NSNotificationCenter defaultCenter] removeObserver:self
-                                                        name:AVPlayerItemDidPlayToEndTime
+                                                        name:@"AVPlayerItemDidPlayToEndTime"
                                                       object:self.bgPlayer.currentItem];
         [self.bgPlayer pause];
     }
@@ -1664,16 +1675,23 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     NSString *vpath = [[NSUserDefaults standardUserDefaults] stringForKey:kKeyBgVideoPath];
     if (!self.bgPlayer || ![self.bgVideoPath isEqualToString:vpath]) {
         [self teardownVideoLayer];
-        AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:vpath]];
-        AVPlayer *p = [AVPlayer playerWithPlayerItem:item];
+        Class playerItemCls = objc_getClass("AVPlayerItem");
+        Class playerCls = objc_getClass("AVPlayer");
+        Class playerLayerCls = objc_getClass("AVPlayerLayer");
+        if (!playerItemCls || !playerCls || !playerLayerCls) {
+            NBLOG(@"[视频] AVFoundation 类不可用，跳过");
+            return;
+        }
+        AVPlayerItem *item = [(id)playerItemCls playerItemWithURL:[NSURL fileURLWithPath:vpath]];
+        AVPlayer *p = [(id)playerCls playerWithPlayerItem:item];
         p.muted = YES;
         self.bgPlayer = p;
-        self.bgLayer = [AVPlayerLayer playerLayerWithPlayer:p];
-        self.bgLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
+        self.bgLayer = [(id)playerLayerCls playerLayerWithPlayer:p];
+        self.bgLayer.videoGravity = (NSString *)@"AVLayerVideoGravityResizeAspectFill";
         self.bgVideoPath = vpath;
         [[NSNotificationCenter defaultCenter] addObserver:self
                                                  selector:@selector(bgVideoDidEnd)
-                                                     name:AVPlayerItemDidPlayToEndTime
+                                                     name:@"AVPlayerItemDidPlayToEndTime"
                                                    object:item];
         NBLOG(@"[视频] 建立 player %@", vpath);
     }
@@ -1689,9 +1707,10 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 // 播完 seek 回开头，实现无缝续播（不用 AVPlayerLooper：这个 Theos SDK 里没有它的声明）
 - (void)bgVideoDidEnd {
     if (!self.bgPlayer) return;
-    [self.bgPlayer seekToTime:kCMTimeZero
-              toleranceBefore:kCMTimeZero
-               toleranceAfter:kCMTimeZero];
+    CMTime z = NBCMZero();
+    [self.bgPlayer seekToTime:z
+              toleranceBefore:z
+               toleranceAfter:z];
     [self.bgPlayer play];
 }
 
