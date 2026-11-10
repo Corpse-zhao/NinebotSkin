@@ -609,8 +609,8 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 @property (copy,   nonatomic) NSString *cachedBgPath;
 
 // 背景视频（无限循环、静音，挂在舞台图层之上、车按钮之下）
-@property (strong, nonatomic) AVQueuePlayer *bgPlayer;
-@property (strong, nonatomic) AVPlayerLooper *bgLooper;
+// 循环用 AVPlayerItemDidPlayToEndTime 通知 seek 回开头 —— 不依赖 AVPlayerLooper
+@property (strong, nonatomic) AVPlayer *bgPlayer;
 @property (strong, nonatomic) AVPlayerLayer *bgLayer;
 @property (copy,   nonatomic) NSString *bgVideoPath;
 
@@ -1640,10 +1640,13 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 }
 
 - (void)teardownVideoLayer {
+    if (self.bgPlayer) {
+        [[NSNotificationCenter defaultCenter] removeObserver:self
+                                                        name:AVPlayerItemDidPlayToEndTime
+                                                      object:self.bgPlayer.currentItem];
+        [self.bgPlayer pause];
+    }
     if (self.bgLayer) [self.bgLayer removeFromSuperlayer];
-    if (self.bgLooper) [self.bgLooper disableLooping];
-    if (self.bgPlayer) { [self.bgPlayer pause]; [self.bgPlayer removeAllItems]; }
-    self.bgLooper = nil;
     self.bgPlayer = nil;
     self.bgLayer = nil;
     self.bgVideoPath = nil;
@@ -1659,16 +1662,16 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     if (!self.bgPlayer || ![self.bgVideoPath isEqualToString:vpath]) {
         [self teardownVideoLayer];
         AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:vpath]];
-        // AVPlayerLooper 要求 player 一开始是空的（它自己负责往里插循环副本），
-        // 先把 item 塞进去再建 looper 会直接抛异常
-        AVQueuePlayer *p = [[AVQueuePlayer alloc] init];
-        p.actionAtItemEnd = AVPlayerActionAtItemEndNone;
+        AVPlayer *p = [AVPlayer playerWithPlayerItem:item];
         p.muted = YES;
         self.bgPlayer = p;
-        self.bgLooper = [[AVPlayerLooper alloc] initWithPlayer:p templateItem:item];
         self.bgLayer = [AVPlayerLayer playerLayerWithPlayer:p];
         self.bgLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
         self.bgVideoPath = vpath;
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(bgVideoDidEnd)
+                                                     name:AVPlayerItemDidPlayToEndTime
+                                                   object:item];
         NBLOG(@"[视频] 建立 player %@", vpath);
     }
     if (self.bgLayer.superlayer != stage.superview.layer) {
@@ -1678,6 +1681,15 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     CGRect inSuper = [stage convertRect:region toView:stage.superview];
     if (!CGRectEqualToRect(self.bgLayer.frame, inSuper)) self.bgLayer.frame = inSuper;
     if (self.bgPlayer.rate == 0.0) [self.bgPlayer play];
+}
+
+// 播完 seek 回开头，实现无缝续播（不用 AVPlayerLooper：这个 Theos SDK 里没有它的声明）
+- (void)bgVideoDidEnd {
+    if (!self.bgPlayer) return;
+    [self.bgPlayer seekToTime:kCMTimeZero
+              toleranceBefore:kCMTimeZero
+               toleranceAfter:kCMTimeZero];
+    [self.bgPlayer play];
 }
 
 // 选一段视频（mp4/mov），拷到沙盒，循环静音播放
