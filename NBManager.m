@@ -772,7 +772,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
         }
         if (!self.adjusting) {
             CGRect want = [self vehicleFrameForCarView:car];
-            if (!CGRectEqualToRect(want, vv.frame)) vv.frame = want;
+            if (!CGRectIsNull(want) && !CGRectEqualToRect(want, vv.frame)) vv.frame = want;
         }
         // 兜底：万一 setHidden: 没拦住（UIKit 内部直接改 layer.hidden 之类）
         if (!car.hidden && self.carStateSaved) car.hidden = YES;
@@ -993,11 +993,19 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 
 // 车辆图层在「原车视图的 superview」里的 frame。
 // 用 carView.frame（不是 bounds）是因为图层和原车是兄弟视图，同一坐标系。
+// 尺寸/位置不可信时返回 CGRectNull，调用方跳过这次布局（别把车图放大或挪走）。
 - (CGRect)vehicleFrameForCarView:(UIView *)v {
-    if (!v) return CGRectZero;
-    CGRect n = [self vehicleNormRect];
+    if (!v) return CGRectNull;
     CGSize bs = v.bounds.size;
+    if (bs.width < 40.0 || bs.height < 40.0) return CGRectNull;   // 布局还没落位
     CGRect f = v.frame;
+    UIView *sp = v.superview;
+    if (sp && sp.bounds.size.width > 1.0 && sp.bounds.size.height > 1.0) {
+        // 原车按钮正常约占父视图 64%×43%；接近铺满说明 cell 复用/布局未完成，抓错了
+        if (f.size.width / sp.bounds.size.width > 0.95 &&
+            f.size.height / sp.bounds.size.height > 0.95) return CGRectNull;
+    }
+    CGRect n = [self vehicleNormRect];
     return CGRectMake(f.origin.x + n.origin.x * bs.width,
                       f.origin.y + n.origin.y * bs.height,
                       n.size.width * bs.width, n.size.height * bs.height);
@@ -1148,7 +1156,8 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 
     UIImageView *vv = self.vehicleView;
     vv.image = veh;
-    vv.frame = [self vehicleFrameForCarView:v];
+    CGRect fr = [self vehicleFrameForCarView:v];
+    if (!CGRectIsNull(fr)) vv.frame = fr;   // 尺寸不可信时不改，等看门狗下次算对
     vv.autoresizingMask = v.autoresizingMask;
     if (vv.superview != v.superview) {
         [vv removeFromSuperview];
