@@ -397,7 +397,7 @@ static char NBOrigEffectKey;
 - (void)finishAdjustVehicle {
     self.editingVehicle = NO;
     UIView *v = self.vehView;
-    UIWindow *win = v.superview ?: [self appMainWindow];
+    UIWindow *win = [v.superview isKindOfClass:[UIWindow class]] ? (UIWindow *)v.superview : [self appMainWindow];
     if (v && win) {
         CGFloat W = win.bounds.size.width, H = win.bounds.size.height;
         if (W > 1 && H > 1) {
@@ -567,7 +567,7 @@ static char NBOrigEffectKey;
 
 - (void)bgTestTop {
     if (!self.bgView) { [self alertDone:@"还没有替换背景图片"]; return; }
-    UIWindow *win = self.bgView.superview ?: [self appMainWindow];
+    UIWindow *win = [self.bgView.superview isKindOfClass:[UIWindow class]] ? (UIWindow *)self.bgView.superview : [self appMainWindow];
     if (!win) return;
     [win addSubview:self.bgView];
     self.bgView.frame = win.bounds;
