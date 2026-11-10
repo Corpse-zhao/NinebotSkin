@@ -8,7 +8,7 @@
 #import <stdlib.h>
 
 // ============================================================
-// NinebotSkin v0.1.13 —— 九号出行 车辆图/背景图替换（图片版）
+// NinebotSkin v0.1.14 —— 九号出行 车辆图/背景图替换（图片版）
 // 注入目标: cn.ninebot.segway
 //
 // 真机 viewtree(4) 把结构钉死了:
@@ -328,6 +328,39 @@ static UIImage *NBNormalizedImage(UIImage *img) {
     }];
 }
 
+// 等比缩到最长边不超过 maxSide（用于把"重新裁剪用的原图"压小，别存 4000px 的 PNG）
+static UIImage *NBScaleImage(UIImage *img, CGFloat maxSide) {
+    if (!img) return nil;
+    CGSize s = img.size;
+    CGFloat m = MAX(s.width, s.height);
+    if (m <= maxSide || m < 1.0) return img;
+    CGFloat k = maxSide / m;
+    CGSize n = CGSizeMake(floor(s.width * k), floor(s.height * k));
+    if (n.width < 1 || n.height < 1) return img;
+    UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat defaultFormat];
+    f.scale = 1.0;
+    f.opaque = NO;
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:n format:f];
+    return [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        [img drawInRect:CGRectMake(0, 0, n.width, n.height)];
+    }];
+}
+
+// 编码 JPEG（比 PNG 快得多，体积也小得多）
+static NSData *NBEncodeJPEG(UIImage *img, CGFloat quality) {
+    CGImageRef cg = img.CGImage;
+    if (!cg) return nil;
+    NSMutableData *out = [NSMutableData data];
+    CGImageDestinationRef dst = CGImageDestinationCreateWithData((__bridge CFMutableDataRef)out,
+                                                                (__bridge CFStringRef)@"public.jpeg", 1, NULL);
+    if (!dst) return nil;
+    NSDictionary *opt = @{(__bridge NSString *)kCGImageDestinationLossyCompressionQuality: @(quality)};
+    CGImageDestinationAddImage(dst, cg, (__bridge CFDictionaryRef)opt);
+    BOOL ok = CGImageDestinationFinalize(dst);
+    CFRelease(dst);
+    return ok ? out : nil;
+}
+
 // ---------- 悬浮球独立的穿透窗口 ----------
 @interface NBPassThroughWindow : UIWindow
 @end
@@ -367,6 +400,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     CGFloat _baseScale;
     BOOL _centered;
 }
+@property (strong, nonatomic) UIImage *sourceImage;   // 裁剪前的原图
 @property (copy, nonatomic) void (^onFinish)(UIImage *img);
 @property (copy, nonatomic) void (^onCancel)(void);
 - (instancetype)initWithImage:(UIImage *)img aspect:(CGFloat)aspect;
@@ -568,6 +602,8 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 @property (strong, nonatomic) UIImage *stageImage;          // 我们给舞台设置的背景图
 @property (copy,   nonatomic) NSString *bgStamp;             // 渲染这张背景时用的文件指纹
 @property (assign, nonatomic) BOOL pendingStageRestore;      // 点了"恢复背景"但当时不在车控页
+@property (strong, nonatomic) UIImage *cachedBgImage;         // 背景解码缓存（避免每次 apply 都读盘解码）
+@property (copy,   nonatomic) NSString *cachedBgPath;
 
 // 车：原车视图（只用来定位 / 当挂载点）+ 我们贴上去的车辆图层
 @property (weak,   nonatomic) UIView *carView;             // 爱车按钮里的那个 UIImageView
@@ -784,18 +820,12 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"背景显示方式（%@）", modeName]
                                            style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *action){ [weakSelf chooseBgMode]; }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"微调车辆图（拖动/双指缩放）" style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *action){ [weakSelf beginAdjust:@"veh"]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"车辆图对准原车（重置位置）" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *action){ [weakSelf resetVehicleRect]; }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"恢复车辆原图" style:UIAlertActionStyleDestructive
-                                         handler:^(UIAlertAction *action){ [weakSelf restoreVehicle]; }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"恢复背景原图" style:UIAlertActionStyleDestructive
-                                         handler:^(UIAlertAction *action){ [weakSelf restoreBackground]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"一键恢复（车辆+背景）" style:UIAlertActionStyleDestructive
+                                         handler:^(UIAlertAction *action){ [weakSelf oneKeyRestore]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"调试：导出视图树" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *action){ [weakSelf dumpViewTree]; }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"调试：查车视图" style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *action){ [weakSelf listCarViews]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel
                                          handler:^(UIAlertAction *action){ [weakSelf unhideBall]; }]];
 
@@ -863,6 +893,21 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
         for (UIView *s in v.subviews) [stack addObject:s];
     }
     return best;
+}
+
+// 背景图解码缓存：同一个路径只解码一次。
+// 换背景走 commitBackgroundImage 时会直接把内存里那张塞进缓存，所以是零解码、零等待。
+- (UIImage *)bgImageForPath:(NSString *)p {
+    if (!p.length) return nil;
+    if (self.cachedBgImage && self.cachedBgPath && [self.cachedBgPath isEqualToString:p]) {
+        return self.cachedBgImage;
+    }
+    UIImage *img = [UIImage imageWithContentsOfFile:p];
+    if (img) {
+        self.cachedBgImage = img;
+        self.cachedBgPath = p;
+    }
+    return img;
 }
 
 - (BOOL)hasAnyReplacement {
@@ -1110,13 +1155,15 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 - (void)applyOverlays {
     UIWindow *win = [self appMainWindow];
     if (!win) return;
-    // 舞台图找不到也不影响换车（比如停在别的页面），只有背景依赖它
-    UIImageView *stage = [self findStageImageView];
+    // 舞台图找不到也不影响换车（比如停在别的页面），只有背景依赖它。
+    // 已有的那个还在 window 上就直接用，别每次都遍历整棵视图树（换背景时这点很关键）。
+    UIImageView *stage = self.stageView;
+    if (!stage || !stage.window) stage = [self findStageImageView];
     if (stage) self.stageView = stage;
 
     NSString *bgPath = [self storedPathForSlot:@"bg"];
     NSString *vehPath = [self storedPathForSlot:@"veh"];
-    UIImage *bgImg = bgPath ? [UIImage imageWithContentsOfFile:bgPath] : nil;
+    UIImage *bgImg = [self bgImageForPath:bgPath];
     UIImage *vehImg = vehPath ? [UIImage imageWithContentsOfFile:vehPath] : nil;
 
     // 1) 找原车视图（定位 + 当挂载点）
@@ -1143,8 +1190,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     //    判断依据是「文件指纹 + image 还是不是我上次设的那张」，
     //    只看指针会漏掉「同一个文件名换了内容」的情况。
     if (stage && bgImg) {
-        NSString *stamp = [NSString stringWithFormat:@"%@|%ld",
-                           [self stampForPath:bgPath], (long)[self bgMode]];
+        NSString *stamp = [self currentBgStampForPath:bgPath];
         BOOL same = (self.stageImage != nil) && (stage.image == self.stageImage) &&
                     (stamp != nil) && (self.bgStamp != nil) && [self.bgStamp isEqualToString:stamp];
         if (!same) {
@@ -1214,20 +1260,29 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
         CGSize px = CGSizeZero;
         CGFloat trim = 0.0;
         BOOL stripped = NO;
-        NSData *png = isVeh ? NBPrepareVehiclePNG(data, &px, &trim, &stripped)
-                            : NBPNGData(data, &px);
         BOOL ok = NO;
         NSString *savedPath = nil;
-        if (png.length) {
-            // 背景存成 bg_src.png（裁剪前的原图），车辆仍然是 veh.png
-            NSString *name = isVeh ? @"veh.png" : @"bg_src.png";
-            NSString *path = [NBLogDir() stringByAppendingPathComponent:name];
-            ok = [png writeToFile:path atomically:YES];
-            savedPath = path;
+        UIImage *bgImage = nil;
+
+        if (isVeh) {
+            NSData *png = NBPrepareVehiclePNG(data, &px, &trim, &stripped);
+            if (png.length) {
+                NSString *path = [NBLogDir() stringByAppendingPathComponent:@"veh.png"];
+                ok = [png writeToFile:path atomically:YES];
+                savedPath = path;
+            }
+            NBLOG(@"[选图] 车辆 原始%luB -> png%luB %.0fx%.0f 去白底=%d 裁边=%.0f%% ok=%d",
+                  (unsigned long)data.length, (unsigned long)png.length,
+                  px.width, px.height, (int)stripped, trim * 100.0, (int)ok);
+        } else {
+            // 背景：只要解码成 UIImage 就够，**不做整图 PNG 重编码**
+            // （4000×3000 的图重编码一次要几百毫秒~1 秒，这就是"选完图半天才进裁剪页"的大头）
+            bgImage = [UIImage imageWithData:data];
+            px = bgImage.size;
+            ok = (bgImage != nil);
+            NBLOG(@"[选图] 背景 原始%luB 解码 %@ ok=%d",
+                  (unsigned long)data.length, NSStringFromCGSize(px), (int)ok);
         }
-        NBLOG(@"[选图] slot=%@ 原始%luB -> png%luB %.0fx%.0f 去白底=%d 裁边=%.0f%% ok=%d",
-              slot, (unsigned long)data.length, (unsigned long)png.length,
-              px.width, px.height, (int)stripped, trim * 100.0, (int)ok);
 
         dispatch_async(dispatch_get_main_queue(), ^{
             if (!ok) {
@@ -1241,13 +1296,11 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
                 NSMutableString *note = [NSMutableString string];
                 if (stripped) [note appendString:@"（已自动去掉白底）"];
                 if (trim > 0.05) [note appendFormat:@"（已裁掉周围 %.0f%% 空白）", trim * 100.0];
-                [note appendString:@"\n位置/大小不对就点悬浮球 → 微调车辆图"];
+                [note appendString:@"\n位置/大小不对就点悬浮球 → 车辆图对准原车"];
                 [self alertDone:[NSString stringWithFormat:@"已替换车辆图片\n%@×%@ px%@",
                                  @((NSInteger)px.width), @((NSInteger)px.height), note]];
             } else {
-                // 背景：原图先存好（裁剪还能反悔），再进裁剪页取景
-                [[NSUserDefaults standardUserDefaults] setObject:savedPath forKey:kKeyBgSrcPath];
-                [self openCropWithSourcePath:savedPath];
+                [self openCropWithImage:bgImage];
             }
         });
     });
@@ -1276,17 +1329,18 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     return r.size.width / r.size.height;
 }
 
-- (void)openCropWithSourcePath:(NSString *)path {
-    UIImage *src = [UIImage imageWithContentsOfFile:path];
+// 拿着内存里的图直接开裁剪页（不再落盘读盘）
+- (void)openCropWithImage:(UIImage *)src {
     if (!src) { [self alertDone:@"图片读取失败，请换一张"]; return; }
     CGFloat aspect = [self bgRegionAspect];
     __weak NBManager *weakSelf = self;
     // picker 刚 dismiss，等转场结束再 present，否则会冲突
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         NBManager *me = weakSelf;
         if (!me) return;
         NBCropViewController *vc = [[NBCropViewController alloc] initWithImage:src aspect:aspect];
+        vc.sourceImage = src;
         // vc 强持有 block，block 里不能再强持有 vc（会循环引用）
         __weak NBCropViewController *weakVC = vc;
         vc.onCancel = ^{
@@ -1302,35 +1356,94 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     });
 }
 
+- (void)openCropWithSourcePath:(NSString *)path {
+    UIImage *src = [UIImage imageWithContentsOfFile:path];
+    if (!src) { [self alertDone:@"图片读取失败，请换一张"]; return; }
+    [self openCropWithImage:src];
+}
+
 - (void)dismissCropVC:(UIViewController *)vc {
     [vc dismissViewControllerAnimated:YES completion:^{ [self unhideBall]; }];
 }
 
+// 关键：**先应用背景，再关裁剪页**。
+// 这样点「完成」的瞬间底下就变了，转场动画滑走时已经看到新背景，不用等 0.3s 的 dismiss 回调。
 - (void)finishCropVC:(UIViewController *)vc image:(UIImage *)img {
+    UIImage *src = nil;
+    if ([vc isKindOfClass:[NBCropViewController class]]) src = ((NBCropViewController *)vc).sourceImage;
+    BOOL ok = [self commitBackgroundImage:img silent:YES];
+    if (src) [self saveBgSourceAsync:src];          // 原图后台落盘，不阻塞
+    NSString *modeNote = ([self bgMode] == 0) ? @"整个上半屏" : @"车控区域";
+    NSString *msg = ok ? [NSString stringWithFormat:@"背景已应用\n%@×%@ px · %@",
+                          @((NSInteger)img.size.width), @((NSInteger)img.size.height), modeNote]
+                       : @"裁剪结果保存失败，请换一张图";
     __weak NBManager *weakSelf = self;
     [vc dismissViewControllerAnimated:YES completion:^{
-        [weakSelf commitBackgroundImage:img];
+        NBManager *me = weakSelf;
+        if (!me) return;
+        [me unhideBall];
+        [me alertDone:msg];
     }];
 }
 
-- (void)commitBackgroundImage:(UIImage *)img {
-    if (!img) { [self alertDone:@"裁剪失败，请换一张图"]; return; }
-    NSData *png = NBEncodePNG(img.CGImage);
-    if (!png.length) { [self alertDone:@"裁剪结果编码失败，请换一张图"]; return; }
-    NSString *path = [NBLogDir() stringByAppendingPathComponent:@"bg.png"];
-    BOOL ok = [png writeToFile:path atomically:YES];
-    NBLOG(@"[裁剪] 写入 %@ %@ ok=%d", NSStringFromCGSize(img.size),
-          [path lastPathComponent], (int)ok);
-    if (!ok) { [self alertDone:@"写文件失败，请检查存储空间"]; return; }
+- (NSString *)currentBgStampForPath:(NSString *)p {
+    NSString *st = [self stampForPath:p];
+    return [NSString stringWithFormat:@"%@|%ld", st ?: @"-", (long)[self bgMode]];
+}
 
+- (BOOL)commitBackgroundImage:(UIImage *)img silent:(BOOL)silent {
+    if (!img) {
+        if (!silent) [self alertDone:@"裁剪失败，请换一张图"];
+        return NO;
+    }
+    NSString *path = [NBLogDir() stringByAppendingPathComponent:@"bg.png"];
+
+    // 顺序很重要：先把「路径 + 内存图」都布好，然后立刻重画。
+    // PNG 编码和写盘都扔到后台，主线程一点都不用等 —— 点「完成」就是马上变。
     [[NSUserDefaults standardUserDefaults] setObject:path forKey:kKeyBgPath];
+    self.cachedBgPath = path;
+    self.cachedBgImage = img;
     self.stageImage = nil;                 // 强制重渲染新背景
     self.bgStamp = nil;
     [self applyOverlays];
     [self scheduleReapply];
-    NSString *modeNote = ([self bgMode] == 0) ? @"整个上半屏" : @"车控区域";
-    [self alertDone:[NSString stringWithFormat:@"背景已应用\n%@×%@ px · %@",
-                     @((NSInteger)img.size.width), @((NSInteger)img.size.height), modeNote]];
+
+    __weak NBManager *weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSData *png = NBEncodePNG(img.CGImage);
+        BOOL ok = png.length ? [png writeToFile:path atomically:YES] : NO;
+        NBLOG(@"[裁剪] 落盘 %@ %@ %luB ok=%d", NSStringFromCGSize(img.size),
+              [path lastPathComponent], (unsigned long)png.length, (int)ok);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NBManager *me = weakSelf;
+            if (!me) return;
+            if (ok) {
+                // 文件已换新，把指纹对齐，免得看门狗以为被改过又重画一次
+                me.bgStamp = [me currentBgStampForPath:path];
+            } else if (!silent) {
+                [me alertDone:@"保存失败，请检查存储空间"];
+            }
+        });
+    });
+    return YES;
+}
+
+// 裁剪前的原图另存一份（供「重新裁剪」用）。
+// 限到最长边 2400 再存 JPEG：够再裁一次，又不会因为 4000px 的 PNG 编码把主线程拖住。
+- (void)saveBgSourceAsync:(UIImage *)src {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        UIImage *small = NBScaleImage(src, 2400.0);
+        NSData *jpg = NBEncodeJPEG(small, 0.95);
+        if (!jpg.length) return;
+        NSString *path = [NBLogDir() stringByAppendingPathComponent:@"bg_src.jpg"];
+        if ([jpg writeToFile:path atomically:YES]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [[NSUserDefaults standardUserDefaults] setObject:path forKey:kKeyBgSrcPath];
+            });
+            NBLOG(@"[裁剪] 原图已存 %@ %@ %luB", NSStringFromCGSize(small.size),
+                  [path lastPathComponent], (unsigned long)jpg.length);
+        }
+    });
 }
 
 // 重新裁剪：用裁剪前的原图重来（没有再退回已应用的图）
@@ -1482,6 +1595,23 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 
 #pragma mark - 恢复
 
+// 一键恢复：车辆 + 背景一起还原，并把相关记录清干净（显示方式的偏好保留）
+- (void)oneKeyRestore {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d removeObjectForKey:kKeyVehPath];
+    [d removeObjectForKey:kKeyVehRect];
+    [d removeObjectForKey:kKeyBgPath];
+    [d removeObjectForKey:kKeyBgRect];
+    self.cachedBgImage = nil;
+    self.cachedBgPath = nil;
+    self.pendingStageRestore = YES;      // 万一此刻不在车控页，回车控页再还
+    [self applyOverlays];
+    [self scheduleReapply];
+    if (![self hasAnyReplacement]) [self restoreOriginalStage];
+    [self alertDone:@"已一键恢复\n车辆图和背景图都回到原样"];
+    NBLOG(@"[恢复] 一键恢复");
+}
+
 - (void)restoreVehicle {
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:kKeyVehPath];
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:kKeyVehRect];
@@ -1495,6 +1625,8 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 - (void)restoreBackground {
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:kKeyBgPath];
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:kKeyBgRect];
+    self.cachedBgImage = nil;
+    self.cachedBgPath = nil;
     // 注意：这里**不能**先把 self.stageImage 清掉。
     // applyOverlays 靠「bgImg 为空 && stageImage 非空」才走 restoreStage，
     // 提前清空会让还原分支永远不成立 —— 之前"恢复背景要重启"就是这么来的。
