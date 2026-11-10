@@ -5,7 +5,6 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <objc/runtime.h>
-#import <objc/message.h>
 #import <unistd.h>
 #import <math.h>
 #import <stdlib.h>
@@ -22,11 +21,6 @@ static CMTime NBCMZero(void) {
     t.flags = 1;
     t.epoch = 0;
     return t;
-}
-
-// 带一个对象参数的消息发送（绕开 Theos SDK 缺失的类工厂方法声明）
-static id NBMsgSend1(id rcv, SEL sel, id arg) {
-    return ((id (*)(id, SEL, id))objc_msgSend)(rcv, sel, arg);
 }
 
 // ============================================================
@@ -61,7 +55,6 @@ static NSString * const kKeyBgRect    = @"nbskin_bg_rect";  // 背景绘制区�
 static NSString * const kKeyBgMode    = @"nbskin_bg_mode";  // 0=整个上半屏 1=车控区域
 static NSString * const kKeyBgSrcPath = @"nbskin_bg_src";   // 裁剪前的原图（再次裁剪用）
 static NSString * const kKeyBgVideoPath = @"nbskin_bg_video_path"; // 背景视频（循环静音播放）
-static NSString * const kKeyBgVideoRect = @"nbskin_bg_video_rect"; // 视频画面裁剪框（归一化 0..1，NSStringFromCGRect）
 
 // 「车控区域」的上边界（相对舞台高度）。
 // 舞台高 441.47；cell 内容区从 y=103 起（「车控」标题那一行）→ 103 / 441.47 ≈ 0.2333
@@ -427,9 +420,6 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 @property (strong, nonatomic) UIImage *sourceImage;   // 裁剪前的原图
 @property (copy, nonatomic) void (^onFinish)(UIImage *img);
 @property (copy, nonatomic) void (^onCancel)(void);
-// 视频模式：不裁像素，只回报归一化裁剪框（相对整张画面 0..1）；非 nil 时 tapDone 走 rect 分支
-@property (copy, nonatomic) void (^onFinishRect)(CGRect rect);
-@property (copy, nonatomic) NSString *cropTitle;      // 顶部标题（默认「裁剪背景图」）
 - (instancetype)initWithImage:(UIImage *)img aspect:(CGFloat)aspect;
 @end
 
@@ -541,7 +531,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     [done addTarget:self action:@selector(tapDone) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:done];
 
-    UILabel *title = [self nbLabel:_cropTitle.length ? _cropTitle : @"裁剪背景图" size:17.0 bold:YES];
+    UILabel *title = [self nbLabel:@"裁剪背景图" size:17.0 bold:YES];
     title.center = CGPointMake(vb.width / 2.0, 68.0);
     [self.view addSubview:title];
 
@@ -586,36 +576,12 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 }
 
 - (void)tapDone {
-    // 视频模式：只回报归一化裁剪框，不产出图片
-    if (self.onFinishRect) {
-        CGRect r = [self normalizedCropRect];
-        if (CGRectIsNull(r)) r = CGRectMake(0.0, 0.0, 1.0, 1.0);
-        self.onFinishRect(r);
-        return;
-    }
     UIImage *out = [self croppedImage];
     if (!out) {
         // 裁不出来就把原图交回去，别让用户卡在这一页
         out = NBNormalizedImage(_source);
     }
     if (self.onFinish) self.onFinish(out);
-}
-
-// 当前裁剪框相对整张画面的归一化 rect（0..1）。取不到时返回 CGRectNull
-- (CGRect)normalizedCropRect {
-    if (!_scroll || !_iv) return CGRectNull;
-    CGFloat s = _baseScale * _scroll.zoomScale;
-    if (s <= 0.0001) return CGRectNull;
-    CGPoint o = _scroll.contentOffset;
-    CGRect r = CGRectMake(o.x / s, o.y / s, _cropSize.width / s, _cropSize.height / s);
-    UIImage *flat = NBNormalizedImage(_source);
-    if (!flat) return CGRectNull;
-    CGSize fs = flat.size;
-    if (fs.width < 1.0 || fs.height < 1.0) return CGRectNull;
-    r = CGRectIntersection(r, CGRectMake(0.0, 0.0, fs.width, fs.height));
-    if (CGRectIsNull(r) || r.size.width < 1.0 || r.size.height < 1.0) return CGRectNull;
-    return CGRectMake(r.origin.x / fs.width, r.origin.y / fs.height,
-                      r.size.width / fs.width, r.size.height / fs.height);
 }
 
 - (UIImage *)croppedImage {
@@ -811,16 +777,13 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
         if (!car.hidden && self.carStateSaved) car.hidden = YES;
     }
 
-    // 背景视频：层被摘了就重挂；播到结尾就 seek 回开头重播（通知兜底 + 时间检查双保险）
+    // 背景视频：层被摘了就重挂，播放停了就续上
     if (self.bgLayer) {
         UIImageView *sv = self.stageView;
         if (sv && sv.superview) {
             if (self.bgLayer.superlayer != sv.superview.layer) {
                 NBLOG(@"[看门狗] 视频层掉了，重挂");
                 [self applyVideoLayer];
-            } else if ([self bgVideoAtEnd]) {
-                NBLOG(@"[看门狗] 视频播到结尾，重播");
-                [self restartBgVideo];
             } else if (self.bgPlayer.rate == 0.0) {
                 [self.bgPlayer play];
             }
@@ -896,8 +859,6 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     [ac addAction:[UIAlertAction actionWithTitle:@"重新裁剪背景图" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *action){ [weakSelf recropBackground]; }]];    [ac addAction:[UIAlertAction actionWithTitle:@"替换【背景视频】（循环播放 · 静音）" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *action){ [weakSelf pickVideoFor:@"bgvideo"]; }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"重新裁剪视频画面" style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *action){ [weakSelf recropBgVideo]; }]];
     NSString *modeName = ([self bgMode] == 0) ? @"整个上半屏" : @"车控区域";
     [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"背景显示方式（%@）", modeName]
                                            style:UIAlertActionStyleDefault
@@ -1705,17 +1666,6 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     self.bgVideoPath = nil;
 }
 
-// 视频画面裁剪框（归一化 0..1）。没存或等于全画面时返回 CGRectNull
-- (CGRect)videoCropRect {
-    NSString *s = [[NSUserDefaults standardUserDefaults] stringForKey:kKeyBgVideoRect];
-    if (!s.length) return CGRectNull;
-    CGRect r = CGRectFromString(s);
-    if (r.size.width <= 0.001 || r.size.height <= 0.001) return CGRectNull;
-    if (r.origin.x <= 0.0001 && r.origin.y <= 0.0001 &&
-        r.size.width >= 0.999 && r.size.height >= 0.999) return CGRectNull;
-    return r;
-}
-
 - (void)applyVideoLayer {
     UIImageView *stage = self.stageView;
     if (!stage || !stage.superview || ![self hasBgVideo]) {
@@ -1737,6 +1687,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
         p.muted = YES;
         self.bgPlayer = p;
         self.bgLayer = [(id)playerLayerCls playerLayerWithPlayer:p];
+        self.bgLayer.videoGravity = (NSString *)@"AVLayerVideoGravityResizeAspectFill";
         self.bgVideoPath = vpath;
         [[NSNotificationCenter defaultCenter] addObserver:self
                                                  selector:@selector(bgVideoDidEnd)
@@ -1750,82 +1701,17 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     CGRect region = [self bgRegionInSize:stage.bounds.size];
     CGRect inSuper = [stage convertRect:region toView:stage.superview];
     if (!CGRectEqualToRect(self.bgLayer.frame, inSuper)) self.bgLayer.frame = inSuper;
-
-    // 裁剪画面：把视频里选中的那块（归一化 rect）映射满整个区域。
-    // 裁剪框比例 = 区域比例，所以用 resize + transform 不会拉伸。
-    // 没裁剪时保持 aspectFill 原样（兼容老行为）。
-    CGRect crop = [self videoCropRect];
-    if (!CGRectIsNull(crop)) {
-        self.bgLayer.videoGravity = (NSString *)@"resize";
-        CGFloat W = inSuper.size.width, H = inSuper.size.height;
-        if (W > 1.0 && H > 1.0) {
-            CATransform3D t3 = CATransform3DMakeScale(1.0 / crop.size.width, 1.0 / crop.size.height, 1.0);
-            t3 = CATransform3DTranslate(t3,
-                                        -(crop.origin.x * W) / crop.size.width,
-                                        -(crop.origin.y * H) / crop.size.height, 0);
-            if (!CATransform3DEqualToTransform(self.bgLayer.transform, t3)) self.bgLayer.transform = t3;
-        }
-    } else {
-        self.bgLayer.videoGravity = (NSString *)@"AVLayerVideoGravityResizeAspectFill";
-        if (!CATransform3DIsIdentity(self.bgLayer.transform)) self.bgLayer.transform = CATransform3DIdentity;
-    }
     if (self.bgPlayer.rate == 0.0) [self.bgPlayer play];
 }
 
-// 是否已播到结尾（duration 无效时返回 NO，不误判）
-- (BOOL)bgVideoAtEnd {
-    AVPlayer *p = self.bgPlayer;
-    if (!p || !p.currentItem) return NO;
-    CMTime cur = p.currentTime;
-    CMTime dur = p.currentItem.duration;
-    if (!((dur.flags & 1) && dur.timescale > 0 && cur.timescale > 0)) return NO;
-    double cs = (double)cur.value / (double)cur.timescale;
-    double ds = (double)dur.value / (double)dur.timescale;
-    return ds > 0 && cs >= ds - 0.05;
-}
-
-// seek 回开头继续播（循环的核心动作）
-- (void)restartBgVideo {
+// 播完 seek 回开头，实现无缝续播（不用 AVPlayerLooper：这个 Theos SDK 里没有它的声明）
+- (void)bgVideoDidEnd {
     if (!self.bgPlayer) return;
     CMTime z = NBCMZero();
     [self.bgPlayer seekToTime:z
               toleranceBefore:z
                toleranceAfter:z];
     [self.bgPlayer play];
-}
-
-// 播完 seek 回开头，实现无缝续播（不用 AVPlayerLooper：这个 Theos SDK 里没有它的声明）
-- (void)bgVideoDidEnd {
-    [self restartBgVideo];
-}
-
-// 取视频首帧（AVAssetImageGenerator 全走运行时取类，不引入链接依赖）
-- (void)videoFirstFrame:(NSString *)path completion:(void (^)(UIImage *img, BOOL ok))cb {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        Class assetCls = objc_getClass("AVAsset");
-        Class genCls = objc_getClass("AVAssetImageGenerator");
-        if (!assetCls || !genCls || path.length == 0) {
-            dispatch_async(dispatch_get_main_queue(), ^{ if (cb) cb(nil, NO); });
-            return;
-        }
-        AVAsset *asset = NBMsgSend1(assetCls, @selector(assetWithURL:), [NSURL fileURLWithPath:path]);
-        AVAssetImageGenerator *gen = NBMsgSend1(genCls, @selector(assetImageGeneratorWithAsset:), asset);
-        gen.appliesPreferredTrackTransform = YES;
-        gen.maximumSize = CGSizeMake(1600.0, 1600.0);
-        CMTime at = NBCMZero();
-        CMTime act;
-        NSError *err = nil;
-        CGImageRef cg = [gen copyCGImageAtTime:at actualTime:&act error:&err];
-        UIImage *img = nil;
-        if (cg) {
-            img = [UIImage imageWithCGImage:cg scale:1.0 orientation:UIImageOrientationUp];
-            CGImageRelease(cg);
-        } else {
-            NBLOG(@"[视频] 取首帧失败 %@", err);
-        }
-        BOOL ok = (img != nil);
-        dispatch_async(dispatch_get_main_queue(), ^{ if (cb) cb(img, ok); });
-    });
 }
 
 // 选一段视频（mp4/mov），拷到沙盒，循环静音播放
@@ -1876,68 +1762,12 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
             }
             NSString *dst = [NBLogDir() stringByAppendingPathComponent:@"bg_video.mov"];
             [[NSUserDefaults standardUserDefaults] setObject:dst forKey:kKeyBgVideoPath];
-            [[NSUserDefaults standardUserDefaults] removeObjectForKey:kKeyBgVideoRect];  // 换视频重置裁剪
             [self applyOverlays];        // 里面会挂视频层
             [self scheduleReapply];
-            // 取首帧进裁剪页：选好想显示的画面范围（取消也应用，保持整幅画面）
-            [self videoFirstFrame:dst completion:^(UIImage *img, BOOL ok) {
-                if (!ok) {
-                    NSString *modeNote2 = ([self bgMode] == 0) ? @"整个上半屏" : @"车控区域";
-                    [self alertDone:[NSString stringWithFormat:@"背景视频已应用\n静音循环 · %@\n（取首帧失败，跳过裁剪）", modeNote2]];
-                    return;
-                }
-                [self openVideoCropForImage:img];
-            }];
+            NSString *modeNote = ([self bgMode] == 0) ? @"整个上半屏" : @"车控区域";
+            [self alertDone:[NSString stringWithFormat:@"背景视频已应用\\n静音循环 · %@\\n（同比例竖版视频效果最好）", modeNote]];
         });
     });
-}
-
-// 打开视频画面裁剪页（裁剪框比例 = 区域比例，确定后无拉伸）
-- (void)openVideoCropForImage:(UIImage *)img {
-    if (!img) { [self alertDone:@"视频画面读取失败，请换一个"]; return; }
-    CGFloat aspect = [self bgRegionAspect];
-    __weak NBManager *weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        NBManager *me = weakSelf;
-        if (!me) return;
-        NBCropViewController *vc = [[NBCropViewController alloc] initWithImage:img aspect:aspect];
-        vc.sourceImage = img;
-        vc.cropTitle = @"裁剪视频画面";
-        __weak NBCropViewController *weakVC = vc;
-        vc.onCancel = ^{
-            NBCropViewController *strongVC = weakVC;
-            // 取消 = 保持整幅画面，但视频本身要生效
-            [me applyOverlays];
-            [me scheduleReapply];
-            if (strongVC) [me dismissCropVC:strongVC];
-        };
-        vc.onFinishRect = ^(CGRect rect) {
-            [[NSUserDefaults standardUserDefaults] setObject:NSStringFromCGRect(rect)
-                                                     forKey:kKeyBgVideoRect];
-            [me applyOverlays];
-            [me scheduleReapply];
-            NBCropViewController *strongVC = weakVC;
-            if (strongVC) [me dismissCropVC:strongVC];
-            NSString *modeNote2 = ([me bgMode] == 0) ? @"整个上半屏" : @"车控区域";
-            [me alertDone:[NSString stringWithFormat:@"背景视频已应用\n静音循环 · 自动重播 · %@\n画面已按裁剪范围显示", modeNote2]];
-        };
-        [me presentTracked:vc];
-        NBLOG(@"[裁剪] 打开视频裁剪页 aspect=%.3f", aspect);
-    });
-}
-
-// 菜单入口：对已有背景视频重新裁剪画面
-- (void)recropBgVideo {
-    NSString *p = [[NSUserDefaults standardUserDefaults] stringForKey:kKeyBgVideoPath];
-    if (p.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:p]) {
-        [self alertDone:@"还没有设置背景视频"];
-        return;
-    }
-    [self videoFirstFrame:p completion:^(UIImage *img, BOOL ok) {
-        if (!ok) { [self alertDone:@"取视频画面失败，请重试"]; return; }
-        [self openVideoCropForImage:img];
-    }];
 }
 
 #pragma mark - 恢复
@@ -1950,7 +1780,6 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     [d removeObjectForKey:kKeyBgPath];
     [d removeObjectForKey:kKeyBgRect];
     [d removeObjectForKey:kKeyBgVideoPath];
-    [d removeObjectForKey:kKeyBgVideoRect];
     [self teardownVideoLayer];
     self.cachedBgImage = nil;
     self.cachedBgPath = nil;
