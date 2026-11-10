@@ -8,7 +8,7 @@
 #import <stdlib.h>
 
 // ============================================================
-// NinebotSkin v0.1.14 —— 九号出行 车辆图/背景图替换（图片版）
+// NinebotSkin v0.1.15 —— 九号出行 车辆图/背景图替换（图片版）
 // 注入目标: cn.ninebot.segway
 //
 // 真机 viewtree(4) 把结构钉死了:
@@ -637,6 +637,12 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     NBLOG(@"========== NinebotSkin %@ 启动（%@ pid=%d）==========", NB_VERSION,
           [NSProcessInfo processInfo].processName, (int)getpid());
     [self installHiddenGuard];
+    // 微调入口已移除：任何历史遗留的车辆偏移都没用了，
+    // 一律回到「正好盖住原车」的默认位置，避免升级后车图被旧偏移带歪
+    if ([[NSUserDefaults standardUserDefaults] stringForKey:kKeyVehRect]) {
+        [[NSUserDefaults standardUserDefaults] removeObjectForKey:kKeyVehRect];
+        NBLOG(@"[启动] 已清除历史车辆偏移，车辆图回到对准原车的位置");
+    }
     [self setupRound:0];
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(onForeground)
@@ -820,8 +826,6 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"背景显示方式（%@）", modeName]
                                            style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *action){ [weakSelf chooseBgMode]; }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"车辆图对准原车（重置位置）" style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *action){ [weakSelf resetVehicleRect]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"一键恢复（车辆+背景）" style:UIAlertActionStyleDestructive
                                          handler:^(UIAlertAction *action){ [weakSelf oneKeyRestore]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"调试：导出视图树" style:UIAlertActionStyleDefault
@@ -1290,13 +1294,16 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
                 return;
             }
             if (isVeh) {
+                // 换图就重置位置：永远按「正好盖住原车」对位，
+                // 避免以前残留的偏移把新车图带到别处（菜单里的重置项已按用户要求去掉）
+                [[NSUserDefaults standardUserDefaults] removeObjectForKey:kKeyVehRect];
                 [[NSUserDefaults standardUserDefaults] setObject:savedPath forKey:kKeyVehPath];
                 [self applyOverlays];
                 [self scheduleReapply];
                 NSMutableString *note = [NSMutableString string];
                 if (stripped) [note appendString:@"（已自动去掉白底）"];
                 if (trim > 0.05) [note appendFormat:@"（已裁掉周围 %.0f%% 空白）", trim * 100.0];
-                [note appendString:@"\n位置/大小不对就点悬浮球 → 车辆图对准原车"];
+                [note appendString:@"\n已自动对准原车位置"];
                 [self alertDone:[NSString stringWithFormat:@"已替换车辆图片\n%@×%@ px%@",
                                  @((NSInteger)px.width), @((NSInteger)px.height), note]];
             } else {
