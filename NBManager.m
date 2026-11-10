@@ -23,6 +23,14 @@ static CMTime NBCMZero(void) {
     return t;
 }
 
+// Theos SDK 头文件缺失这两个类工厂方法声明，手动补上（仅编译期，运行时走 objc_getClass）
+@interface AVAsset (NBSkinDecl)
++ (instancetype)assetWithURL:(NSURL *)URL;
+@end
+@interface AVAssetImageGenerator (NBSkinDecl)
++ (instancetype)assetImageGeneratorWithAsset:(AVAsset *)asset;
+@end
+
 // ============================================================
 // NinebotSkin v0.2.0 —— 九号出行 车辆图/背景图替换（图片 + 背景视频）
 // 注入目标: cn.ninebot.segway
