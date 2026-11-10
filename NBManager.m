@@ -38,9 +38,9 @@ static void NBLogLine(NSString *line) {
     NSString *path = [NBLogDir() stringByAppendingPathComponent:@"log.txt"];
     NSFileManager *fm = [NSFileManager defaultManager];
     unsigned long long sz = [[fm attributesOfItemAtPath:path error:NULL] fileSize];
-    if (sz > 400 * 1024) { [out writeToFile:path atomically:YES]; return; }
+    if (sz > 400 * 1024) { [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL]; return; }
     NSFileHandle *h = [NSFileHandle fileHandleForUpdatingAtPath:path];
-    if (!h) { [out writeToFile:path atomically:YES]; return; }
+    if (!h) { [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL]; return; }
     [h seekToEndOfFile];
     [h writeData:[out dataUsingEncoding:NSUTF8StringEncoding]];
     [h closeFile];
@@ -160,17 +160,17 @@ static char NBOrigLayerKey;
                                                                 message:nil
                                                          preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"替换【背景图片】" style:UIAlertActionStyleDefault
-                                         handler:^{ [self pickImageFor:@"bg"]; }]];
+                                         handler:^(UIAlertAction *action){ [self pickImageFor:@"bg"]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"替换【车辆图片】" style:UIAlertActionStyleDefault
-                                         handler:^{ [self pickImageFor:@"veh"]; }]];
+                                         handler:^(UIAlertAction *action){ [self pickImageFor:@"veh"]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"恢复车辆原图" style:UIAlertActionStyleDestructive
-                                         handler:^{ [self restoreVehicle]; }]];
+                                         handler:^(UIAlertAction *action){ [self restoreVehicle]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"恢复背景原图" style:UIAlertActionStyleDestructive
-                                         handler:^{ [self restoreBackground]; }]];
+                                         handler:^(UIAlertAction *action){ [self restoreBackground]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"调试：导出视图树" style:UIAlertActionStyleDefault
-                                         handler:^{ [self dumpViewTree]; }]];
+                                         handler:^(UIAlertAction *action){ [self dumpViewTree]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel
-                                         handler:^{ [self unhideBall]; }]];
+                                         handler:^(UIAlertAction *action){ [self unhideBall]; }]];
 
     if (ac.popoverPresentationController) {
         ac.popoverPresentationController.sourceView = self.ballButton ?: top.view;
@@ -235,7 +235,7 @@ static char NBOrigLayerKey;
     if (!res) { [self unhideBall]; return; }
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSData *data = nil;
+        __block NSData *data = nil;
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
         [res.itemProvider loadFileRepresentationForTypeIdentifier:@"public.image"
                                                completionHandler:^(NSURL *url, NSError *error) {
@@ -247,7 +247,14 @@ static char NBOrigLayerKey;
             dispatch_semaphore_signal(sem);
         }];
         dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)));
-        if (!data) data = [res.itemProvider loadDataRepresentationForTypeIdentifier:@"public.image" error:NULL];
+        if (!data) {
+            [res.itemProvider loadDataRepresentationForTypeIdentifier:@"public.image"
+                                                   completionHandler:^(NSData *d2, NSError *e2) {
+                data = d2;
+                dispatch_semaphore_signal(sem);
+            }];
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)));
+        }
 
         BOOL ok = NO; NSString *savedPath = nil;
         if (data.length > 0) {
@@ -279,7 +286,7 @@ static char NBOrigLayerKey;
                                                                 message:msg
                                                          preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault
-                                         handler:^{ [self unhideBall]; }]];
+                                         handler:^(UIAlertAction *action){ [self unhideBall]; }]];
     [top presentViewController:ac animated:YES completion:nil];
 }
 
@@ -433,7 +440,7 @@ static char NBOrigLayerKey;
     UIWindow *win = [self appMainWindow];
     if (win) [self dump:win.rootViewController.view to:out depth:0];
     NSString *path = [NBLogDir() stringByAppendingPathComponent:@"viewtree.txt"];
-    [out writeToFile:path atomically:YES];
+    [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL];
     [self alertDone:[NSString stringWithFormat:@"已导出:\n%@", path]];
     NBLOG(@"[调试] 视图树导出 %lu 行", (unsigned long)out.length);
 }
@@ -441,7 +448,7 @@ static char NBOrigLayerKey;
 - (void)dump:(UIView *)view to:(NSMutableString *)out depth:(NSInteger)depth {
     if (!view || depth > 9) return;
     [out appendFormat:@"%@%@ frame=%@ alpha=%.2f hidden=%d bg=%@\n",
-     [@"" stringByPaddingToLength:depth * 2 withString:@" " startingIndex:0],
+     [@"" stringByPaddingToLength:depth * 2 withString:@" " startingAtIndex:0],
      NSStringFromClass([view class]),
      NSStringFromCGRect(view.frame),
      view.alpha, (int)view.hidden,
