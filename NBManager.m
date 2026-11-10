@@ -2,13 +2,15 @@
 #import <UIKit/UIKit.h>
 #import <PhotosUI/PhotosUI.h>
 #import <ImageIO/ImageIO.h>
+#import <AVFoundation/AVFoundation.h>
+#import <CoreMedia/CoreMedia.h>
 #import <objc/runtime.h>
 #import <unistd.h>
 #import <math.h>
 #import <stdlib.h>
 
 // ============================================================
-// NinebotSkin v0.1.15 —— 九号出行 车辆图/背景图替换（图片版）
+// NinebotSkin v0.2.0 —— 九号出行 车辆图/背景图替换（图片 + 背景视频）
 // 注入目标: cn.ninebot.segway
 //
 // 真机 viewtree(4) 把结构钉死了:
@@ -38,6 +40,7 @@ static NSString * const kKeyVehRect   = @"nbskin_veh_rect"; // 相对「原车�
 static NSString * const kKeyBgRect    = @"nbskin_bg_rect";  // 背景绘制区域（相对舞台）
 static NSString * const kKeyBgMode    = @"nbskin_bg_mode";  // 0=整个上半屏 1=车控区域
 static NSString * const kKeyBgSrcPath = @"nbskin_bg_src";   // 裁剪前的原图（再次裁剪用）
+static NSString * const kKeyBgVideoPath = @"nbskin_bg_video_path"; // 背景视频（循环静音播放）
 
 // 「车控区域」的上边界（相对舞台高度）。
 // 舞台高 441.47；cell 内容区从 y=103 起（「车控」标题那一行）→ 103 / 441.47 ≈ 0.2333
@@ -605,6 +608,12 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 @property (strong, nonatomic) UIImage *cachedBgImage;         // 背景解码缓存（避免每次 apply 都读盘解码）
 @property (copy,   nonatomic) NSString *cachedBgPath;
 
+// 背景视频（无限循环、静音，挂在舞台图层之上、车按钮之下）
+@property (strong, nonatomic) AVQueuePlayer *bgPlayer;
+@property (strong, nonatomic) AVPlayerLooper *bgLooper;
+@property (strong, nonatomic) AVPlayerLayer *bgLayer;
+@property (copy,   nonatomic) NSString *bgVideoPath;
+
 // 车：原车视图（只用来定位 / 当挂载点）+ 我们贴上去的车辆图层
 @property (weak,   nonatomic) UIView *carView;             // 爱车按钮里的那个 UIImageView
 @property (strong, nonatomic) UIImageView *vehicleView;    // 我们自己贴的车辆图层（挂在 carView.superview 最上层）
@@ -753,6 +762,19 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
         // 兜底：万一 setHidden: 没拦住（UIKit 内部直接改 layer.hidden 之类）
         if (!car.hidden && self.carStateSaved) car.hidden = YES;
     }
+
+    // 背景视频：层被摘了就重挂，播放停了就续上
+    if (self.bgLayer) {
+        UIImageView *sv = self.stageView;
+        if (sv && sv.superview) {
+            if (self.bgLayer.superlayer != sv.superview.layer) {
+                NBLOG(@"[看门狗] 视频层掉了，重挂");
+                [self applyVideoLayer];
+            } else if (self.bgPlayer.rate == 0.0) {
+                [self.bgPlayer play];
+            }
+        }
+    }
 }
 
 #pragma mark - 悬浮球
@@ -821,7 +843,8 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     [ac addAction:[UIAlertAction actionWithTitle:@"替换【背景图片】（选图后可裁剪）" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *action){ [weakSelf pickImageFor:@"bg"]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"重新裁剪背景图" style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *action){ [weakSelf recropBackground]; }]];
+                                         handler:^(UIAlertAction *action){ [weakSelf recropBackground]; }]];    [ac addAction:[UIAlertAction actionWithTitle:@"替换【背景视频】（循环播放 · 静音）" style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *action){ [weakSelf pickVideoFor:@"bgvideo"]; }]];
     NSString *modeName = ([self bgMode] == 0) ? @"整个上半屏" : @"车控区域";
     [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"背景显示方式（%@）", modeName]
                                            style:UIAlertActionStyleDefault
@@ -915,7 +938,9 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 }
 
 - (BOOL)hasAnyReplacement {
-    return [self storedPathForSlot:@"bg"] != nil || [self storedPathForSlot:@"veh"] != nil;
+    return [self hasBgVideo] ||
+           [self storedPathForSlot:@"bg"] != nil ||
+           [self storedPathForSlot:@"veh"] != nil;
 }
 
 - (NSString *)storedPathForSlot:(NSString *)slot {
@@ -1217,6 +1242,9 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     } else if (!vehImg && self.vehicleView) {
         [self restoreCarViews];
     }
+
+    // 5) 背景视频（有视频就盖在背景上，循环静音）
+    [self applyVideoLayer];
 }
 
 #pragma mark - 选图
@@ -1237,6 +1265,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     [picker dismissViewControllerAnimated:YES completion:nil];
     PHPickerResult *res = [results firstObject];
     if (!res) { [self unhideBall]; return; }
+    if ([slot isEqualToString:@"bgvideo"]) { [self handleVideoResult:res]; return; }
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         __block NSData *data = nil;
@@ -1600,6 +1629,113 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     [self alertDone:@"车辆图已对准原车位置（正好盖住原车）"];
 }
 
+#pragma mark - 背景视频
+// 一段静音循环的视频铺在背景上：
+//   · 层级：舞台图层 < 视频层 < 车按钮容器（车、水印照常画在上面）
+//   · frame 跟随「背景显示方式」：整个上半屏 = 舞台全幅；车控区域 = 只铺那一块
+//   · AVPlayerLooper 无限循环，muted 静音，不占音频会话
+- (BOOL)hasBgVideo {
+    NSString *p = [[NSUserDefaults standardUserDefaults] stringForKey:kKeyBgVideoPath];
+    return p.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:p];
+}
+
+- (void)teardownVideoLayer {
+    if (self.bgLayer) [self.bgLayer removeFromSuperlayer];
+    if (self.bgLooper) [self.bgLooper disableLooping];
+    if (self.bgPlayer) { [self.bgPlayer pause]; [self.bgPlayer removeAllItems]; }
+    self.bgLooper = nil;
+    self.bgPlayer = nil;
+    self.bgLayer = nil;
+    self.bgVideoPath = nil;
+}
+
+- (void)applyVideoLayer {
+    UIImageView *stage = self.stageView;
+    if (!stage || !stage.superview || ![self hasBgVideo]) {
+        [self teardownVideoLayer];
+        return;
+    }
+    NSString *vpath = [[NSUserDefaults standardUserDefaults] stringForKey:kKeyBgVideoPath];
+    if (!self.bgPlayer || ![self.bgVideoPath isEqualToString:vpath]) {
+        [self teardownVideoLayer];
+        AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:vpath]];
+        // AVPlayerLooper 要求 player 一开始是空的（它自己负责往里插循环副本），
+        // 先把 item 塞进去再建 looper 会直接抛异常
+        AVQueuePlayer *p = [[AVQueuePlayer alloc] init];
+        p.actionAtItemEnd = AVPlayerActionAtItemEndNone;
+        p.muted = YES;
+        self.bgPlayer = p;
+        self.bgLooper = [[AVPlayerLooper alloc] initWithPlayer:p templateItem:item];
+        self.bgLayer = [AVPlayerLayer playerLayerWithPlayer:p];
+        self.bgLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
+        self.bgVideoPath = vpath;
+        NBLOG(@"[视频] 建立 player %@", vpath);
+    }
+    if (self.bgLayer.superlayer != stage.superview.layer) {
+        [stage.superview.layer insertSublayer:self.bgLayer above:stage.layer];
+    }
+    CGRect region = [self bgRegionInSize:stage.bounds.size];
+    CGRect inSuper = [stage convertRect:region toView:stage.superview];
+    if (!CGRectEqualToRect(self.bgLayer.frame, inSuper)) self.bgLayer.frame = inSuper;
+    if (self.bgPlayer.rate == 0.0) [self.bgPlayer play];
+}
+
+// 选一段视频（mp4/mov），拷到沙盒，循环静音播放
+- (void)pickVideoFor:(NSString *)slot {
+    self.pickingSlot = slot;
+    PHPickerConfiguration *cfg = [[PHPickerConfiguration alloc] init];
+    cfg.filter = [PHPickerFilter videosFilter];
+    cfg.selectionLimit = 1;
+    PHPickerViewController *picker = [[PHPickerViewController alloc] initWithConfiguration:cfg];
+    picker.delegate = self;
+    NBLOG(@"[选视频] 打开 picker");
+    [self presentTracked:picker];
+}
+
+- (void)handleVideoResult:(PHPickerResult *)res {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        __block BOOL copied = NO;
+        __block NSString *err = nil;
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        void (^load)(NSString *) = ^(NSString *tid) {
+            [res.itemProvider loadFileRepresentationForTypeIdentifier:tid
+                                                    completionHandler:^(NSURL *url, NSError *error) {
+                if (url) {
+                    [url startAccessingSecurityScopedResource];
+                    NSString *dst = [NBLogDir() stringByAppendingPathComponent:@"bg_video.mov"];
+                    [[NSFileManager defaultManager] removeItemAtPath:dst error:NULL];
+                    copied = [[NSFileManager defaultManager] copyItemAtPath:url.path toPath:dst error:NULL];
+                    if (!copied) err = [NSString stringWithFormat:@"拷贝失败 %@", error];
+                    [url stopAccessingSecurityScopedResource];
+                }
+                dispatch_semaphore_signal(sem);
+            }];
+        };
+        load(@"public.movie");
+        if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC))) != 0) {
+            err = @"读取超时";
+        }
+        if (!copied) {
+            // 有的视频标的是 mpeg-4 而不是 movie，再试一次
+            load(@"public.mpeg-4");
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)));
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!copied) {
+                [self alertDone:err.length ? [NSString stringWithFormat:@"视频读取失败：%@", err]
+                                            : @"视频读取失败，请换一个（mp4/mov）"];
+                return;
+            }
+            NSString *dst = [NBLogDir() stringByAppendingPathComponent:@"bg_video.mov"];
+            [[NSUserDefaults standardUserDefaults] setObject:dst forKey:kKeyBgVideoPath];
+            [self applyOverlays];        // 里面会挂视频层
+            [self scheduleReapply];
+            NSString *modeNote = ([self bgMode] == 0) ? @"整个上半屏" : @"车控区域";
+            [self alertDone:[NSString stringWithFormat:@"背景视频已应用\\n静音循环 · %@\\n（同比例竖版视频效果最好）", modeNote]];
+        });
+    });
+}
+
 #pragma mark - 恢复
 
 // 一键恢复：车辆 + 背景一起还原，并把相关记录清干净（显示方式的偏好保留）
@@ -1609,6 +1745,8 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     [d removeObjectForKey:kKeyVehRect];
     [d removeObjectForKey:kKeyBgPath];
     [d removeObjectForKey:kKeyBgRect];
+    [d removeObjectForKey:kKeyBgVideoPath];
+    [self teardownVideoLayer];
     self.cachedBgImage = nil;
     self.cachedBgPath = nil;
     self.pendingStageRestore = YES;      // 万一此刻不在车控页，回车控页再还
