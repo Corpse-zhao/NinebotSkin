@@ -1,37 +1,33 @@
 #import "NBManager.h"
 #import <UIKit/UIKit.h>
 #import <PhotosUI/PhotosUI.h>
+#import <ImageIO/ImageIO.h>
 #import <objc/runtime.h>
 #import <unistd.h>
 #import <math.h>
 
 // ============================================================
-// NinebotSkin v0.1.2 —— 九号出行 车辆图/背景图替换（图片版）
+// NinebotSkin v0.1.3 —— 九号出行 车辆图/背景图替换（图片版）
 // 注入目标: cn.ninebot.segway
 //
-// 页面真实结构（真机 viewtree 实测，430×932）:
-//   UIView (430×983, bg=Y)          <- 页面容器，overlay 放这里
-//     UIImageView {0,0,430,441.47}  <- 「ninebot 舞台图」：水印 + 原车烘在同一张图里
-//     UIImageView ×2 同尺寸（hidden）
-//     UIView {0,391,430,50}
-//     UITableView {0,0,430,900}     <- 卡片列表（背景透明，cells 从 y=666 起）
-//
-// v0.1.2:
-//   1. 背景图铺满舞台层，插在 TableView 之下、舞台图之上
-//      （旧版塞 window index0，被这张不透明舞台图整张盖住 => "不生效"）
-//   2. 车辆图默认对准原车位置（容器比例 0.21,0.2485,0.61,0.1981）
-//   3. 替换车辆图/背景图后，把原舞台图 alpha=0 => 原车图案隐藏
-//   4. 取消全屏 alpha 击杀（副作用大且已不需要）
+// v0.1.3 关键改动（针对真机反馈）:
+//   1. 不再"猜容器"，而是先定位「舞台图」UIImageView（宽≈屏宽、高≈0.47屏高），
+//      再把 cover/bg/veh 三个视图插成它的**兄弟视图**、紧贴其上层。
+//      => overlay 与原车图在同一父视图里，滚动行为完全一致，且天然盖住原车。
+//   2. 新增白色 coverView 遮罩舞台区：即使 App 把舞台图 alpha 还原，原车也露不出来。
+//   3. 选图后用 ImageIO 统一转成 PNG 落盘（HEIC / 特殊 JPEG 也能用），
+//      并在日志与弹窗里报告像素尺寸，彻底解决"替换后一片白"。
+//   4. 看门狗：每 2.5s 轻量自检，发现舞台图被还原/overlay 被摘掉就自动补回。
 // ============================================================
 
 static NSString * const kTargetBundle = @"cn.ninebot.segway";
 static NSString * const kKeyBgPath    = @"nbskin_bg_path";
 static NSString * const kKeyVehPath   = @"nbskin_veh_path";
-static NSString * const kKeyVehRect   = @"nbskin_veh_rect"; // 页面容器比例
-static NSString * const kKeyBgRect    = @"nbskin_bg_rect";  // 页面容器比例（空=跟随舞台图）
+static NSString * const kKeyVehRect   = @"nbskin_veh_rect"; // 舞台父视图比例
+static NSString * const kKeyBgRect    = @"nbskin_bg_rect";
 
 static NSString * const kDefaultVehRect = @"0.21,0.2485,0.61,0.1981";
-static NSString * const kDefaultBgRect  = @"0,0,1,0.4491";   // 441.47/983
+static NSString * const kDefaultBgRect  = @"0,0,1,0.4491";
 
 static char NBOrigAlphaKey;
 
@@ -68,6 +64,26 @@ static void NBLogLine(NSString *line) {
 
 #define NBLOG(...) do { NBLogLine([NSString stringWithFormat:__VA_ARGS__]); } while (0)
 
+// 任意图片数据 -> PNG（同时回传像素尺寸），兼容 HEIC / CMYK / 带旋转
+static NSData *NBPNGData(NSData *data, CGSize *outSize) {
+    if (!data.length) return nil;
+    CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
+    if (!src) return nil;
+    CGImageRef img = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+    CFRelease(src);
+    if (!img) return nil;
+    if (outSize) *outSize = CGSizeMake(CGImageGetWidth(img), CGImageGetHeight(img));
+    NSMutableData *out = [NSMutableData data];
+    CGImageDestinationRef dst = CGImageDestinationCreateWithData((__bridge CFMutableDataRef)out,
+                                                                (__bridge CFStringRef)@"public.png", 1, NULL);
+    if (!dst) { CGImageRelease(img); return nil; }
+    CGImageDestinationAddImage(dst, img, NULL);
+    BOOL ok = CGImageDestinationFinalize(dst);
+    CFRelease(dst);
+    CGImageRelease(img);
+    return ok ? out : nil;
+}
+
 // ---------- 穿透窗口 ----------
 @interface NBPassThroughWindow : UIWindow
 @end
@@ -83,13 +99,16 @@ static void NBLogLine(NSString *line) {
 @interface NBManager () <PHPickerViewControllerDelegate>
 @property (strong, nonatomic) UIWindow *ballWindow;
 @property (strong, nonatomic) UIButton *ballButton;
+@property (strong, nonatomic) UIView *coverView;      // 舞台区白底遮罩
 @property (strong, nonatomic) UIImageView *bgView;
 @property (strong, nonatomic) UIImageView *vehView;
-@property (strong, nonatomic) UIWindow *hostWindow;
+@property (weak,   nonatomic) UIImageView *stageView; // 原车+水印舞台图
+@property (weak,   nonatomic) UIWindow *hostWindow;
 @property (copy,   nonatomic) NSString *pickingSlot;
-@property (copy,   nonatomic) NSString *adjustTarget;  // @"veh" / @"bg"
+@property (copy,   nonatomic) NSString *adjustTarget;
 @property (strong, nonatomic) UIPanGestureRecognizer *adjustPan;
 @property (strong, nonatomic) UIPinchGestureRecognizer *adjustPinch;
+@property (strong, nonatomic) NSTimer *watchdog;
 @property (assign, nonatomic) NSInteger reapplyLeft;
 @end
 
@@ -127,6 +146,7 @@ static void NBLogLine(NSString *line) {
         if (![self installBall]) { [self setupRound:round + 1]; return; }
         [self applyOverlays];
         [self scheduleReapply];
+        [self startWatchdog];
     });
 }
 
@@ -138,11 +158,36 @@ static void NBLogLine(NSString *line) {
 - (void)tickReapply {
     if (self.reapplyLeft <= 0) return;
     self.reapplyLeft--;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         [self applyOverlays];
         [self tickReapply];
     });
+}
+
+- (void)startWatchdog {
+    if (self.watchdog) return;
+    __weak NBManager *weakSelf = self;
+    self.watchdog = [NSTimer scheduledTimerWithTimeInterval:2.5 repeats:YES block:^(NSTimer *t) {
+        [weakSelf watchdogTick];
+    }];
+    NBLOG(@"[看门狗] 启动");
+}
+
+- (void)watchdogTick {
+    if (![self hasAnyReplacement]) return;
+    UIImageView *stage = [self findStageImageView];
+    if (!stage) return;
+    BOOL lost = (self.bgView && !self.bgView.superview);
+    if (self.vehView && !self.vehView.superview) lost = YES;
+    BOOL stageBack = (stage.alpha > 0.01);
+    BOOL wrongOrder = (self.bgView && self.bgView.superview == stage.superview &&
+                       [stage.superview.subviews indexOfObject:self.bgView] <
+                       [stage.superview.subviews indexOfObject:stage]);
+    if (lost || stageBack || wrongOrder) {
+        NBLOG(@"[看门狗] 补应用 lost=%d stageBack=%d order=%d", (int)lost, (int)stageBack, (int)wrongOrder);
+        [self applyOverlays];
+    }
 }
 
 #pragma mark - 悬浮球
@@ -219,8 +264,6 @@ static void NBLogLine(NSString *line) {
                                          handler:^(UIAlertAction *action){ [self restoreVehicle]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"恢复背景原图" style:UIAlertActionStyleDestructive
                                          handler:^(UIAlertAction *action){ [self restoreBackground]; }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"重新应用（切页后用）" style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *action){ [self applyOverlays]; [self scheduleReapply]; [self alertDone:@"已重新应用"]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"调试：导出视图树" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *action){ [self dumpViewTree]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel
@@ -266,73 +309,63 @@ static void NBLogLine(NSString *line) {
     return best;
 }
 
-#pragma mark - 页面结构探测
+#pragma mark - 舞台图定位
 
-- (UIView *)findPageHostWithTable:(UITableView **)outTable stage:(CGRect *)outStage {
+- (UIImageView *)findStageImageView {
     UIWindow *win = [self appMainWindow];
     if (!win || !win.rootViewController.view) return nil;
-    CGSize winSize = win.bounds.size;
-
-    UITableView *found = nil;
+    CGSize ws = win.bounds.size;
+    UIImageView *best = nil;
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:win.rootViewController.view];
     while (stack.count) {
         UIView *v = stack.lastObject;
         [stack removeLastObject];
-        if ([v isKindOfClass:[UITableView class]] &&
-            !v.hidden && v.alpha > 0.5 &&
-            v.bounds.size.height >= winSize.height * 0.75) {
-            found = (UITableView *)v;
-            break;
+        if (v == self.bgView || v == self.vehView || v == self.coverView) continue;
+        if ([v isKindOfClass:[UIImageView class]]) {
+            UIImageView *iv = (UIImageView *)v;
+            CGSize b = iv.bounds.size;
+            if (iv.image && !iv.hidden && b.width >= ws.width * 0.85 &&
+                b.height >= ws.height * 0.20 && b.height <= ws.height * 0.65) {
+                if (!best || b.height > best.bounds.size.height) best = iv;
+            }
         }
         for (UIView *s in v.subviews) [stack addObject:s];
     }
-    if (!found || !found.superview) return nil;
-
-    UIView *host = found.superview;
-    UIImageView *stage = nil;
-    for (UIView *s in host.subviews) {
-        if (![s isKindOfClass:[UIImageView class]]) continue;
-        UIImageView *iv = (UIImageView *)s;
-        if (!iv.image || iv.hidden || iv.alpha < 0.5) continue;
-        if (iv.bounds.size.width < host.bounds.size.width * 0.85) continue;
-        if (iv.bounds.size.height < winSize.height * 0.20) continue;
-        if (iv.bounds.size.height > winSize.height * 0.65) continue;
-        if (!stage || iv.bounds.size.height > stage.bounds.size.height) stage = iv;
-    }
-
-    if (outTable) *outTable = found;
-    if (outStage) *outStage = stage ? stage.frame
-                                    : CGRectMake(0, 0, host.bounds.size.width,
-                                                 host.bounds.size.height * 0.4491);
-    NBLOG(@"[结构] 容器 %@ %.0fx%.0f 舞台 %@",
-          NSStringFromClass([host class]), host.bounds.size.width, host.bounds.size.height,
-          NSStringFromCGRect(outStage ? *outStage : CGRectZero));
-    return host;
+    return best;
 }
 
-// 原车图案和 ninebot 水印烘在同一张舞台图里 => 隐藏原车 = 舞台图 alpha 0
-- (void)setStageImagesHidden:(BOOL)hidden inHost:(UIView *)host stage:(CGRect)stageFrame {
-    if (!host) return;
-    CGSize s = host.bounds.size;
-    for (UIView *v in host.subviews) {
-        if (![v isKindOfClass:[UIImageView class]]) continue;
-        UIImageView *iv = (UIImageView *)v;
-        if (!iv.image) continue;
-        if (iv.bounds.size.width < s.width * 0.85) continue;
-        if (fabs(iv.bounds.size.height - stageFrame.size.height) > 2.0) continue;
-        if (hidden) {
+- (BOOL)hasAnyReplacement {
+    return [self storedPathForSlot:@"bg"] != nil || [self storedPathForSlot:@"veh"] != nil;
+}
+
+- (void)setStageHidden:(BOOL)hidden stage:(UIImageView *)stage {
+    if (!stage) return;
+    if (hidden) {
+        if (!objc_getAssociatedObject(stage, &NBOrigAlphaKey))
+            objc_setAssociatedObject(stage, &NBOrigAlphaKey, @(stage.alpha), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        stage.alpha = 0.0;
+        // 同尺寸的兄弟图一起隐藏（多套皮肤缓存）
+        UIView *host = stage.superview;
+        for (UIView *s in host.subviews) {
+            if (s == stage || ![s isKindOfClass:[UIImageView class]]) continue;
+            UIImageView *iv = (UIImageView *)s;
+            if (!iv.image) continue;
+            if (fabs(iv.frame.size.width - stage.frame.size.width) > 1.0) continue;
+            if (fabs(iv.frame.size.height - stage.frame.size.height) > 1.0) continue;
             if (!objc_getAssociatedObject(iv, &NBOrigAlphaKey))
                 objc_setAssociatedObject(iv, &NBOrigAlphaKey, @(iv.alpha), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             iv.alpha = 0.0;
-        } else {
-            id oa = objc_getAssociatedObject(iv, &NBOrigAlphaKey);
+        }
+    } else {
+        NSArray<UIView *> *subs = stage.superview.subviews;
+        for (UIView *s in subs) {
+            id oa = objc_getAssociatedObject(s, &NBOrigAlphaKey);
             if (oa) {
-                iv.alpha = [oa floatValue];
-                objc_setAssociatedObject(iv, &NBOrigAlphaKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                s.alpha = [oa floatValue];
+                objc_setAssociatedObject(s, &NBOrigAlphaKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             }
         }
     }
-    NBLOG(@"[舞台] %@", hidden ? @"原车/水印图层已隐藏" : @"原车/水印图层已恢复");
 }
 
 #pragma mark - 选图
@@ -376,28 +409,33 @@ static void NBLogLine(NSString *line) {
             dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)));
         }
 
-        BOOL ok = NO; NSString *savedPath = nil;
-        if (data.length > 0) {
+        CGSize px = CGSizeZero;
+        NSData *png = NBPNGData(data, &px);
+        BOOL ok = NO;
+        NSString *savedPath = nil;
+        if (png.length) {
             NSString *path = [NBLogDir() stringByAppendingPathComponent:
-                              [NSString stringWithFormat:@"%@.img", slot]];
-            ok = [data writeToFile:path atomically:YES];
+                              [NSString stringWithFormat:@"%@.png", slot]];
+            ok = [png writeToFile:path atomically:YES];
             savedPath = path;
+            [[NSFileManager defaultManager] removeItemAtPath:
+             [NBLogDir() stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.img", slot]]
+                                                      error:NULL];
         }
+        NBLOG(@"[选图] slot=%@ 原始 %luB -> png %luB %.0fx%.0f ok=%d",
+              slot, (unsigned long)data.length, (unsigned long)png.length, px.width, px.height, (int)ok);
+
         dispatch_async(dispatch_get_main_queue(), ^{
             if (ok) {
-                [[NSUserDefaults standardUserDefaults] setObject:savedPath
-                                                          forKey:[slot isEqualToString:@"veh"] ? kKeyVehPath : kKeyBgPath];
+                NSString *key = [slot isEqualToString:@"veh"] ? kKeyVehPath : kKeyBgPath;
+                [[NSUserDefaults standardUserDefaults] setObject:savedPath forKey:key];
                 [self applyOverlays];
                 [self scheduleReapply];
-                if ([slot isEqualToString:@"veh"]) {
-                    [self alertDone:@"已替换车辆图片\n原车图案已隐藏，可用「微调车辆图」修正位置"];
-                } else {
-                    [self alertDone:@"已替换背景（ninebot 区域）"];
-                }
-                NBLOG(@"[选图] 成功 slot=%@ size=%lu", slot, (unsigned long)data.length);
+                NSString *label = [slot isEqualToString:@"veh"] ? @"车辆图片" : @"背景图片";
+                [self alertDone:[NSString stringWithFormat:@"已替换%@\n%@×%@ px\n原车/水印已隐藏",
+                                 label, @((NSInteger)px.width), @((NSInteger)px.height)]];
             } else {
-                [self alertDone:@"导入失败，请换一张图片试试"];
-                NBLOG(@"[选图] 失败 slot=%@", slot);
+                [self alertDone:@"图片解析失败（可能是特殊格式），请换一张"];
             }
         });
     });
@@ -414,9 +452,9 @@ static void NBLogLine(NSString *line) {
     [top presentViewController:ac animated:YES completion:nil];
 }
 
-#pragma mark - 位置与放置
+#pragma mark - 位置
 
-- (CGRect)frameForRectKey:(NSString *)key default:(NSString *)def inHost:(UIView *)host {
+- (CGRect)frameForRectKey:(NSString *)key default:(NSString *)def inView:(UIView *)ref {
     NSString *raw = [[NSUserDefaults standardUserDefaults] stringForKey:key];
     if (!raw.length) raw = def;
     if (!raw.length) return CGRectZero;
@@ -425,21 +463,8 @@ static void NBLogLine(NSString *line) {
     CGFloat fy = p.count > 1 ? [p[1] floatValue] : 0.0;
     CGFloat fw = p.count > 2 ? [p[2] floatValue] : 1.0;
     CGFloat fh = p.count > 3 ? [p[3] floatValue] : 1.0;
-    CGSize s = host.bounds.size;
+    CGSize s = ref.bounds.size;
     return CGRectMake(fx * s.width, fy * s.height, fw * s.width, fh * s.height);
-}
-
-- (void)placeView:(UIView *)v inHost:(UIView *)host below:(UIView *)table {
-    if (!v || !host) return;
-    if (v.superview != host) {
-        [v removeFromSuperview];
-        [host addSubview:v];
-    }
-    if (table && table.superview == host && v != table) {
-        [host insertSubview:v belowSubview:table];
-    } else {
-        [host bringSubviewToFront:v];
-    }
 }
 
 - (NSString *)storedPathForSlot:(NSString *)slot {
@@ -449,50 +474,67 @@ static void NBLogLine(NSString *line) {
     return p;
 }
 
+#pragma mark - 应用 overlay
+
 - (void)applyOverlays {
     UIWindow *win = [self appMainWindow];
     if (!win) return;
     self.hostWindow = win;
 
-    UITableView *table = nil;
-    CGRect stageFrame = CGRectZero;
-    UIView *host = [self findPageHostWithTable:&table stage:&stageFrame];
+    UIImageView *stage = [self findStageImageView];
+    if (!stage || !stage.superview) { NBLOG(@"[overlay] 未找到舞台图"); return; }
+    self.stageView = stage;
+    UIView *host = stage.superview;
+    CGRect stageRect = stage.frame;
 
     NSString *bgPath = [self storedPathForSlot:@"bg"];
     NSString *vehPath = [self storedPathForSlot:@"veh"];
     UIImage *bgImg = bgPath ? [UIImage imageWithContentsOfFile:bgPath] : nil;
     UIImage *vehImg = vehPath ? [UIImage imageWithContentsOfFile:vehPath] : nil;
+    if (bgPath && !bgImg) NBLOG(@"[overlay] ⚠️ 背景图解码失败：%@", bgPath);
+    if (vehPath && !vehImg) NBLOG(@"[overlay] ⚠️ 车辆图解码失败：%@", vehPath);
 
-    // 只要替换了任一图层，就把「原车+水印」舞台图隐藏，避免原车重叠
-    [self setStageImagesHidden:(bgImg != nil || vehImg != nil) inHost:host stage:stageFrame];
+    BOOL active = (bgImg != nil || vehImg != nil);
 
-    // ---- 背景 ----
+    if (!active) {
+        [self setStageHidden:NO stage:stage];
+        [self.coverView removeFromSuperview];
+        [self.bgView removeFromSuperview];
+        [self.vehView removeFromSuperview];
+        return;
+    }
+
+    [self setStageHidden:YES stage:stage];
+
+    // 三个视图先从父视图摘下，保证插入顺序可控
+    if (self.coverView.superview) [self.coverView removeFromSuperview];
+    if (self.bgView.superview) [self.bgView removeFromSuperview];
+    if (self.vehView.superview) [self.vehView removeFromSuperview];
+
+    // 白底遮罩：原车即使被 App 还原 alpha 也露不出来
+    if (!self.coverView) {
+        self.coverView = [UIView new];
+        self.coverView.userInteractionEnabled = NO;
+        self.coverView.backgroundColor = [UIColor whiteColor];
+    }
+    self.coverView.frame = stageRect;
+
     if (bgImg) {
         if (!self.bgView) {
             self.bgView = [UIImageView new];
             self.bgView.userInteractionEnabled = NO;
             self.bgView.contentMode = UIViewContentModeScaleAspectFill;
             self.bgView.clipsToBounds = YES;
-            self.bgView.backgroundColor = [UIColor whiteColor]; // 白底，贴合「白色区域」
+            self.bgView.backgroundColor = [UIColor whiteColor];
         }
         self.bgView.image = bgImg;
-        if (host) {
-            NSString *custom = [[NSUserDefaults standardUserDefaults] stringForKey:kKeyBgRect];
-            self.bgView.frame = custom.length ? [self frameForRectKey:kKeyBgRect default:kDefaultBgRect inHost:host]
-                                              : stageFrame;
-            if (![self.adjustTarget isEqualToString:@"bg"]) {
-                [self placeView:self.bgView inHost:host below:table];
-            }
-        } else if (self.bgView.superview != win) {
-            self.bgView.frame = win.bounds;
-            [win insertSubview:self.bgView atIndex:0];
-            NBLOG(@"[overlay] 未找到页面容器，退化 window 底层");
+        NSString *custom = [[NSUserDefaults standardUserDefaults] stringForKey:kKeyBgRect];
+        if (![self.adjustTarget isEqualToString:@"bg"]) {
+            self.bgView.frame = custom.length ? [self frameForRectKey:kKeyBgRect default:kDefaultBgRect inView:host]
+                                              : stageRect;
         }
-    } else if (self.bgView) {
-        [self.bgView removeFromSuperview];
     }
 
-    // ---- 车辆 ----
     if (vehImg) {
         if (!self.vehView) {
             self.vehView = [UIImageView new];
@@ -500,20 +542,28 @@ static void NBLogLine(NSString *line) {
             self.vehView.contentMode = UIViewContentModeScaleAspectFit;
         }
         self.vehView.image = vehImg;
-        if (host) {
-            if (![self.adjustTarget isEqualToString:@"veh"]) {
-                self.vehView.frame = [self frameForRectKey:kKeyVehRect default:kDefaultVehRect inHost:host];
-                [self placeView:self.vehView inHost:host below:table];
-            }
-        } else {
-            if (![self.adjustTarget isEqualToString:@"veh"]) {
-                self.vehView.frame = [self frameForRectKey:kKeyVehRect default:kDefaultVehRect inHost:win];
-            }
-            [win addSubview:self.vehView];
+        if (![self.adjustTarget isEqualToString:@"veh"]) {
+            self.vehView.frame = [self frameForRectKey:kKeyVehRect default:kDefaultVehRect inView:host];
         }
-    } else if (self.vehView) {
-        [self.vehView removeFromSuperview];
     }
+
+    // 统一插入：紧贴舞台图之上（cover -> bg -> veh），与原车同一父视图 => 滚动同步
+    NSUInteger idx = [host.subviews indexOfObject:stage];
+    if (idx == NSNotFound) idx = host.subviews.count ? host.subviews.count - 1 : 0;
+    NSUInteger ins = idx + 1;
+    [host insertSubview:self.coverView atIndex:MIN(ins, host.subviews.count)];
+    ins++;
+    if (bgImg) {
+        [host insertSubview:self.bgView atIndex:MIN(ins, host.subviews.count)];
+        ins++;
+    }
+    if (vehImg) {
+        [host insertSubview:self.vehView atIndex:MIN(ins, host.subviews.count)];
+    }
+
+    NBLOG(@"[overlay] host=%@ stage=%@ bg=%d veh=%d cover=%@",
+          NSStringFromClass([host class]), NSStringFromCGRect(stageRect),
+          bgImg != nil, vehImg != nil, NSStringFromCGRect(self.coverView.frame));
 }
 
 #pragma mark - 现场微调
@@ -534,7 +584,7 @@ static void NBLogLine(NSString *line) {
     if (self.adjustPinch.view) [self.adjustPinch.view removeGestureRecognizer:self.adjustPinch];
     [v addGestureRecognizer:self.adjustPan];
     [v addGestureRecognizer:self.adjustPinch];
-    [v.superview bringSubviewToFront:v]; // 编辑期间置顶，否则被 TableView 抢触摸
+    [v.superview bringSubviewToFront:v];
     [self.ballButton setTitle:@"✓" forState:UIControlStateNormal];
     [self unhideBall];
     NBLOG(@"[微调] 进入 %@ frame=%@", target, NSStringFromCGRect(v.frame));
@@ -570,7 +620,6 @@ static void NBLogLine(NSString *line) {
     BOOL isBG = [self.adjustTarget isEqualToString:@"bg"];
     UIView *v = isBG ? self.bgView : self.vehView;
     UIView *host = v.superview;
-    NSString *target = self.adjustTarget ?: @"veh";
     if (v && host) {
         CGFloat W = host.bounds.size.width, H = host.bounds.size.height;
         if (W > 1 && H > 1) {
@@ -579,7 +628,7 @@ static void NBLogLine(NSString *line) {
                               f.origin.x / W, f.origin.y / H, f.size.width / W, f.size.height / H];
             NSString *key = isBG ? kKeyBgRect : kKeyVehRect;
             [[NSUserDefaults standardUserDefaults] setObject:rect forKey:key];
-            NBLOG(@"[微调] 保存 %@ = %@", target, rect);
+            NBLOG(@"[微调] 保存 %@ = %@", isBG ? @"bg" : @"veh", rect);
         }
     }
     v.userInteractionEnabled = NO;
@@ -623,6 +672,9 @@ static void NBLogLine(NSString *line) {
     if (win) {
         [out appendFormat:@"[window] %@ bounds=%@\n", NSStringFromClass([win class]),
          NSStringFromCGRect(win.bounds)];
+        UIImageView *stage = [self findStageImageView];
+        [out appendFormat:@"[stage] %@ frame=%@ alpha=%.2f\n", stage ? NSStringFromClass([stage class]) : @"nil",
+         stage ? NSStringFromCGRect(stage.frame) : @"-", stage ? stage.alpha : -1.0];
         [self dump:win.rootViewController.view to:out depth:0];
     }
     NSString *path = [NBLogDir() stringByAppendingPathComponent:@"viewtree.txt"];
@@ -633,13 +685,14 @@ static void NBLogLine(NSString *line) {
 
 - (void)dump:(UIView *)view to:(NSMutableString *)out depth:(NSInteger)depth {
     if (!view || depth > 18) return;
-    [out appendFormat:@"%@%@ frame=%@ alpha=%.2f hidden=%d bg=%@ img=%@\n",
+    [out appendFormat:@"%@%@ frame=%@ alpha=%.2f hidden=%d bg=%@ img=%@ %@\n",
      [@"" stringByPaddingToLength:depth * 2 withString:@" " startingAtIndex:0],
      NSStringFromClass([view class]),
      NSStringFromCGRect(view.frame),
      view.alpha, (int)view.hidden,
      view.backgroundColor ? @"Y" : @"-",
-     view.layer.contents ? @"Y" : @"-"];
+     view.layer.contents ? @"Y" : @"-",
+     (view == self.coverView ? @"<COVER>" : (view == self.bgView ? @"<BG>" : (view == self.vehView ? @"<VEH>" : @"")))];
     for (UIView *sub in [view.subviews copy]) [self dump:sub to:out depth:depth + 1];
 }
 
