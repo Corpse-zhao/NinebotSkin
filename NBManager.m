@@ -5,10 +5,21 @@
 #import <objc/runtime.h>
 #import <unistd.h>
 #import <math.h>
+#import <stdlib.h>
 
 // ============================================================
-// NinebotSkin v0.1.5 —— 九号出行 车辆图/背景图替换（图片版）
+// NinebotSkin v0.1.6 —— 九号出行 车辆图/背景图替换（图片版）
 // 注入目标: cn.ninebot.segway
+//
+// v0.1.6 修三件事（都来自真机录屏）:
+//   1) 车辆图导入后"像没替换"、要微调才看得见
+//      → 用户选的图常常四周大片留白，aspectFit 进原车框后车只剩一小块。
+//        现在落盘前先「去白底 + 按主体裁边」，主体直接撑满原车框。
+//   2) 背后一圈白底
+//      → 有背景图时根本不需要白块遮原车（背景已整张覆盖舞台），原来是多余的白填充。
+//   3) 上下滑动车辆图被拉伸
+//      → 原来强制 contentMode = ScaleToFill，而首页顶部是「下拉会拉伸的弹性头」，
+//        bounds 一变整张合成图就被拉长。改回 AspectFill 等比缩放。
 //
 // 页面结构（真机 viewtree ×3 实测，430×932）:
 //   OuterScrollView(932, 会滚动) → UIView(430×983)
@@ -17,13 +28,10 @@
 //         UIImageView ×2 同尺寸(hidden)
 //         UITableView {0,0,430,900}                 <- 卡片列表，自己的滚动
 //
-// v0.1.5 换机制（前三版 overlay 方案失败的原因）:
+// 为什么是「改写舞台图」而不是叠 overlay（v0.1.0~v0.1.4 全败在这）:
 //   舞台图与卡片表是兄弟，滚动由两个不同容器驱动 —— 无论怎么插 overlay，
 //   都会被其中一个"钉住"或盖住（表现为不动 / 只闪一下 / 露出原车）。
-//   正解：**直接改写舞台图自己的 image**：把 [背景图 + 车辆图] 用 CoreGraphics
-//   合成成一张与舞台等尺寸的图灌进去。它是 App 自己的视图，滚动、层级、
-//   裁剪天然全部正确；原车与水印也随原图一起被替换掉。
-//   恢复原图时把捕获到的原图还回去。
+//   改写舞台图自己的 image 后，滚动、层级、裁剪天然全部正确。
 // ============================================================
 
 static NSString * const kTargetBundle = @"cn.ninebot.segway";
@@ -88,6 +96,173 @@ static NSData *NBPNGData(NSData *data, CGSize *outSize) {
     return ok ? out : nil;
 }
 
+// ---------- 车辆图预处理：去白底 + 裁掉四周空白 ----------
+// 用户选的图常常是「白底/带场景的产品图」，直接塞进车辆框会有两个毛病：
+//   1) 图里大片留白 → 车在框里显得很小，看起来像"没替换"
+//   2) 白底会跟着画上去 → 背后一圈白块
+// 这里在落盘前一次性处理：把四边连通的近白像素抹成透明，再按不透明主体裁边。
+
+static NSData *NBEncodePNG(CGImageRef img) {
+    if (!img) return nil;
+    NSMutableData *out = [NSMutableData data];
+    CGImageDestinationRef dst = CGImageDestinationCreateWithData((__bridge CFMutableDataRef)out,
+                                                                (__bridge CFStringRef)@"public.png", 1, NULL);
+    if (!dst) return nil;
+    CGImageDestinationAddImage(dst, img, NULL);
+    BOOL ok = CGImageDestinationFinalize(dst);
+    CFRelease(dst);
+    return ok ? out : nil;
+}
+
+// 扫描线泛洪：从四边把连通的近白像素抹成透明。返回被抹掉的像素数。
+// alpha 在这里被当成"已处理"标记：255 = 未处理，0 = 已抹掉。
+static size_t NBStripWhite(uint8_t *p, int w, int h) {
+    const int T = 243;
+    size_t cap = (size_t)(w + h) * 8 + 1024;
+    int32_t *sx = (int32_t *)malloc(sizeof(int32_t) * cap);
+    int32_t *sy = (int32_t *)malloc(sizeof(int32_t) * cap);
+    if (!sx || !sy) { free(sx); free(sy); return 0; }
+    size_t sp = 0;
+
+#define NB_IS_BG(q) ((q)[3] == 255 && (q)[0] >= T && (q)[1] >= T && (q)[2] >= T)
+#define NB_PUSH(px, py) do { if (sp < cap) { sx[sp] = (px); sy[sp] = (py); sp++; } } while (0)
+
+    for (int x = 0; x < w; x++) {
+        if (NB_IS_BG(p + (size_t)x * 4)) NB_PUSH(x, 0);
+        if (NB_IS_BG(p + ((size_t)(h - 1) * w + x) * 4)) NB_PUSH(x, h - 1);
+    }
+    for (int y = 0; y < h; y++) {
+        if (NB_IS_BG(p + (size_t)y * w * 4)) NB_PUSH(0, y);
+        if (NB_IS_BG(p + ((size_t)y * w + w - 1) * 4)) NB_PUSH(w - 1, y);
+    }
+
+    size_t filled = 0;
+    while (sp > 0) {
+        sp--;
+        int x = sx[sp], y = sy[sp];
+        uint8_t *row = p + (size_t)y * w * 4;
+        if (!NB_IS_BG(row + (size_t)x * 4)) continue;
+        int l = x, r = x;
+        while (l - 1 >= 0 && NB_IS_BG(row + (size_t)(l - 1) * 4)) l--;
+        while (r + 1 < w && NB_IS_BG(row + (size_t)(r + 1) * 4)) r++;
+        for (int i = l; i <= r; i++) {
+            uint8_t *q = row + (size_t)i * 4;
+            q[0] = q[1] = q[2] = q[3] = 0;
+            filled++;
+        }
+        for (int dy = -1; dy <= 1; dy += 2) {
+            int ny = y + dy;
+            if (ny < 0 || ny >= h) continue;
+            uint8_t *nrow = p + (size_t)ny * w * 4;
+            BOOL run = NO;
+            for (int i = l; i <= r; i++) {
+                BOOL bg = NB_IS_BG(nrow + (size_t)i * 4);
+                if (bg && !run) { NB_PUSH(i, ny); run = YES; }
+                else if (!bg) run = NO;
+            }
+        }
+    }
+#undef NB_IS_BG
+#undef NB_PUSH
+    free(sx); free(sy);
+    return filled;
+}
+
+static CGRect NBOpaqueBounds(uint8_t *p, int w, int h) {
+    int minX = w, minY = h, maxX = -1, maxY = -1;
+    for (int y = 0; y < h; y++) {
+        uint8_t *row = p + (size_t)y * w * 4;
+        for (int x = 0; x < w; x++) {
+            if (row[(size_t)x * 4 + 3] > 8) {
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+            }
+        }
+    }
+    if (maxX < 0) return CGRectZero;
+    return CGRectMake(minX, minY, maxX - minX + 1, maxY - minY + 1);
+}
+
+// 输出：去白底 + 裁边后的 PNG
+static NSData *NBPrepareVehiclePNG(NSData *data, CGSize *outPx, CGFloat *outTrim, BOOL *outStripped) {
+    if (outTrim) *outTrim = 0.0;
+    if (outStripped) *outStripped = NO;
+    if (!data.length) return nil;
+    CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
+    if (!src) return nil;
+    CGImageRef img = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+    CFRelease(src);
+    if (!img) return nil;
+    size_t ow = CGImageGetWidth(img), oh = CGImageGetHeight(img);
+    if (outPx) *outPx = CGSizeMake(ow, oh);
+    if (!ow || !oh) { CGImageRelease(img); return nil; }
+
+    // 车辆图最终只会画在 ~800×600 的框里，超过 1600px 的一律先缩，省内存也省时间
+    CGFloat sc = 1.0;
+    if (MAX(ow, oh) > 1600) sc = 1600.0 / (CGFloat)MAX(ow, oh);
+    size_t w = (size_t)lround((double)ow * sc), h = (size_t)lround((double)oh * sc);
+    if (!w) w = 1;
+    if (!h) h = 1;
+
+    NSMutableData *buf = [NSMutableData dataWithLength:w * 4 * h];
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(buf.mutableBytes, w, h, 8, w * 4, cs,
+                                             kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
+    if (!ctx) { CGImageRelease(img); return nil; }
+    CGContextSetInterpolationQuality(ctx, kCGInterpolationHigh);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h), img);
+    CGImageRelease(img);
+
+    uint8_t *p = (uint8_t *)buf.mutableBytes;
+    size_t px = w * h;
+    BOOL opaque = YES;
+    for (size_t i = 0; i < px; i++) { if (p[i * 4 + 3] < 250) { opaque = NO; break; } }
+
+    if (opaque) {
+        // 完全没有透明像素 → 很可能是白底图，试着把白底抹掉
+        size_t filled = NBStripWhite(p, (int)w, (int)h);
+        if (filled > px * 9 / 10) {
+            // 几乎整张都被当成背景了（判断失误），回退到原图
+            CGContextRelease(ctx);
+            return NBPNGData(data, NULL);
+        }
+        if (filled > px / 100) { if (outStripped) *outStripped = YES; }
+    }
+
+    CGRect box = NBOpaqueBounds(p, (int)w, (int)h);
+    CGImageRef full = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
+    if (!full) return NBPNGData(data, NULL);
+
+    CGRect use = CGRectMake(0, 0, (CGFloat)w, (CGFloat)h);
+    if (!CGRectIsEmpty(box)) {
+        CGFloat area = box.size.width * box.size.height;
+        if (area >= (CGFloat)px * 0.06 && area <= (CGFloat)px * 0.995) {
+            use = CGRectIntegral(CGRectInset(box, -box.size.width * 0.02, -box.size.height * 0.02));
+            use = CGRectIntersection(use, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h));
+            if (CGRectIsNull(use) || use.size.width < 1 || use.size.height < 1)
+                use = CGRectMake(0, 0, (CGFloat)w, (CGFloat)h);
+            else if (outTrim) *outTrim = 1.0 - area / ((CGFloat)px);
+        }
+    }
+
+    NSData *out = nil;
+    if (use.size.width < (CGFloat)w || use.size.height < (CGFloat)h) {
+        CGImageRef cropped = CGImageCreateWithImageInRect(full, use);
+        if (cropped) {
+            out = NBEncodePNG(cropped);
+            if (out && outPx) *outPx = CGSizeMake(CGImageGetWidth(cropped), CGImageGetHeight(cropped));
+            CGImageRelease(cropped);
+        }
+    }
+    if (!out) out = NBEncodePNG(full);
+    CGImageRelease(full);
+    return out;
+}
+
 // aspectFill / aspectFit 绘制
 static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
     if (!img || CGRectIsEmpty(rect)) return;
@@ -129,6 +304,7 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
 @property (assign, nonatomic) BOOL contentModeCaptured;
 @property (assign, nonatomic) UIViewContentMode originalContentMode;
 @property (strong, nonatomic) UIImage *compositeImage;       // 我们自己合成的舞台图
+@property (strong, nonatomic) UIImage *lastCompositeImage;   // 上一次合成的图（不清空，用于识别"这不是原图"）
 @property (strong, nonatomic) UIImageView *adjustView;       // 仅微调时临时显示
 @property (copy,   nonatomic) NSString *pickingSlot;
 @property (copy,   nonatomic) NSString *adjustTarget;
@@ -406,17 +582,15 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
         CGContextFillRect(c, CGRectMake(0, 0, sz.width, sz.height));
         // 2) 背景图 / 或原舞台图
         if (bgImg) {
+            // 背景整张覆盖舞台，原车已经不存在了，绝不能再加白块
             NBDrawImage(c, bgImg, bgRect, YES);
         } else if (orig) {
             NBDrawImage(c, orig, CGRectMake(0, 0, sz.width, sz.height), YES);
-            // 没有新背景就把原车那块用白色盖掉
-            [[UIColor whiteColor] setFill];
-            CGContextFillRect(c, vehRect);
         }
         // 3) 车辆图
         if (vehImg) {
-            if (bgImg) {
-                // 有背景时必须先把原车遮掉（背景图上没车）
+            if (!bgImg) {
+                // 没有换背景时，原车还在原图里，只能用白块把它抹掉（ninebot 区域本身就是白的）
                 [[UIColor whiteColor] setFill];
                 CGContextFillRect(c, vehRect);
             }
@@ -446,8 +620,9 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
         return;
     }
 
-    // 捕获原图（只在第一次、且当前不是我们合成的图时）
-    if (!self.originalStageImage && stage.image && stage.image != self.compositeImage) {
+    // 捕获原图（只在没有原图、且当前显示的不是我们合成的图时）
+    if (!self.originalStageImage && stage.image &&
+        stage.image != self.compositeImage && stage.image != self.lastCompositeImage) {
         self.originalStageImage = stage.image;
         NBLOG(@"[合成] 已捕获原舞台图 %@", NSStringFromCGSize(self.originalStageImage.size));
     }
@@ -462,10 +637,13 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
     UIImage *composite = [self renderCompositeForStage:stage host:stage.superview];
     if (!composite) { NBLOG(@"[合成] 失败（无图或尺寸异常）"); return; }
     self.compositeImage = composite;
+    self.lastCompositeImage = composite;
 
     if (stage.image != composite) {
         stage.image = composite;
-        stage.contentMode = UIViewContentModeScaleToFill; // 合成图已按舞台尺寸排版
+        // 不能用 ScaleToFill：首页顶部是「下拉会拉伸的弹性头」，bounds 一变整张图就被拉长。
+        // 改成 AspectFill 等比缩放，和原车图行为一致，上下滑动不会被拉伸变形。
+        stage.contentMode = UIViewContentModeScaleAspectFill;
     }
 }
 
@@ -510,8 +688,12 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
             dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)));
         }
 
+        BOOL isVeh = [slot isEqualToString:@"veh"];
         CGSize px = CGSizeZero;
-        NSData *png = NBPNGData(data, &px);
+        CGFloat trim = 0.0;
+        BOOL stripped = NO;
+        NSData *png = isVeh ? NBPrepareVehiclePNG(data, &px, &trim, &stripped)
+                            : NBPNGData(data, &px);
         BOOL ok = NO;
         NSString *savedPath = nil;
         if (png.length) {
@@ -520,18 +702,23 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
             ok = [png writeToFile:path atomically:YES];
             savedPath = path;
         }
-        NBLOG(@"[选图] slot=%@ 原始%luB -> png%luB %.0fx%.0f ok=%d",
-              slot, (unsigned long)data.length, (unsigned long)png.length, px.width, px.height, (int)ok);
+        NBLOG(@"[选图] slot=%@ 原始%luB -> png%luB %.0fx%.0f 去白底=%d 裁边=%.0f%% ok=%d",
+              slot, (unsigned long)data.length, (unsigned long)png.length,
+              px.width, px.height, (int)stripped, trim * 100.0, (int)ok);
 
         dispatch_async(dispatch_get_main_queue(), ^{
             if (ok) {
-                NSString *key = [slot isEqualToString:@"veh"] ? kKeyVehPath : kKeyBgPath;
+                NSString *key = isVeh ? kKeyVehPath : kKeyBgPath;
                 [[NSUserDefaults standardUserDefaults] setObject:savedPath forKey:key];
                 [self applyOverlays];
                 [self scheduleReapply];
-                NSString *label = [slot isEqualToString:@"veh"] ? @"车辆图片" : @"背景图片";
-                [self alertDone:[NSString stringWithFormat:@"已替换%@\n%@×%@ px",
-                                 label, @((NSInteger)px.width), @((NSInteger)px.height)]];
+                NSString *label = isVeh ? @"车辆图片" : @"背景图片";
+                NSMutableString *note = [NSMutableString string];
+                if (stripped) [note appendString:@"（已自动去掉白底）"];
+                if (trim > 0.05) [note appendFormat:@"（已裁掉周围 %.0f%% 空白）", trim * 100.0];
+                if (isVeh) [note appendString:@"\n位置/大小不对就点悬浮球 → 微调车辆图"];
+                [self alertDone:[NSString stringWithFormat:@"已替换%@\n%@×%@ px%@",
+                                 label, @((NSInteger)px.width), @((NSInteger)px.height), note]];
             } else {
                 [self alertDone:@"图片解析失败（格式特殊），请换一张"];
             }
