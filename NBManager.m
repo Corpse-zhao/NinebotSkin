@@ -8,7 +8,7 @@
 #import <stdlib.h>
 
 // ============================================================
-// NinebotSkin v0.1.10 —— 九号出行 车辆图/背景图替换（图片版）
+// NinebotSkin v0.1.11 —— 九号出行 车辆图/背景图替换（图片版）
 // 注入目标: cn.ninebot.segway
 //
 // 真机 viewtree(4) 把结构钉死了:
@@ -320,6 +320,21 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
 }
 @end
 
+// ---------- 反闪：把「原车图被 App 重新显示」这件事同步拦下来 ----------
+// 切页面 / cell 复用时，App 会把原车图的 hidden 设回 NO。看门狗哪怕 0.15s 补一次，
+// 也总有一帧原车。这里直接接管 UIView 的 -setHidden:，对这一张图当场改回 YES，
+// 做到「零帧」。只拦「设为可见」这一种情况，其余全部原样透传。
+static __weak UIView *gNBCarGuard = nil;
+static IMP gNBOrigSetHidden = NULL;
+
+static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
+    if (!hidden) {
+        UIView *guard = gNBCarGuard;
+        if (guard && guard == self) hidden = YES;
+    }
+    if (gNBOrigSetHidden) ((void (*)(id, SEL, BOOL))gNBOrigSetHidden)(self, _cmd, hidden);
+}
+
 @interface NBManager () <PHPickerViewControllerDelegate>
 @property (strong, nonatomic) UIWindow *ballWindow;
 @property (strong, nonatomic) UIButton *ballButton;
@@ -330,6 +345,7 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
 @property (assign, nonatomic) BOOL contentModeCaptured;
 @property (assign, nonatomic) UIViewContentMode originalStageContentMode;
 @property (strong, nonatomic) UIImage *stageImage;          // 我们给舞台设置的背景图
+@property (copy,   nonatomic) NSString *bgStamp;             // 渲染这张背景时用的文件指纹
 
 // 车：原车视图（只用来定位 / 当挂载点）+ 我们贴上去的车辆图层
 @property (weak,   nonatomic) UIView *carView;             // 爱车按钮里的那个 UIImageView
@@ -362,11 +378,21 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
     if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:kTargetBundle]) return;
     NBLOG(@"========== NinebotSkin %@ 启动（%@ pid=%d）==========", NB_VERSION,
           [NSProcessInfo processInfo].processName, (int)getpid());
+    [self installHiddenGuard];
     [self setupRound:0];
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(onForeground)
                                                  name:UIApplicationDidBecomeActiveNotification
                                                object:nil];
+}
+
+// 接管 -[UIView setHidden:]，用来「原车图被设回可见」时同步纠正（见文件上方 NBCarSetHidden）
+- (void)installHiddenGuard {
+    if (gNBOrigSetHidden) return;
+    Method m = class_getInstanceMethod([UIView class], @selector(setHidden:));
+    if (!m) { NBLOG(@"[反闪] 没找到 setHidden:，退回看门狗轮询"); return; }
+    gNBOrigSetHidden = method_setImplementation(m, (IMP)NBCarSetHidden);
+    NBLOG(@"[反闪] 已接管 UIView -setHidden:");
 }
 
 - (void)onForeground {
@@ -395,22 +421,27 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
 - (void)startWatchdog {
     if (self.watchdog) return;
     __weak NBManager *weakSelf = self;
-    // 0.6s：App 每次刷新数据都会重设 stage.image，要尽快补回
-    self.watchdog = [NSTimer scheduledTimerWithTimeInterval:0.6 repeats:YES block:^(NSTimer *t) {
+    // 0.2s：切页面时 App 会重设 hidden / 重设 stage.image，要尽快补回。
+    // tick 本身很轻（不遍历视图树，只在舞台图丢失时才扫描），所以 0.2s 不会拖帧。
+    self.watchdog = [NSTimer scheduledTimerWithTimeInterval:0.2 repeats:YES block:^(NSTimer *t) {
         [weakSelf watchdogTick];
     }];
-    NBLOG(@"[看门狗] 启动");
+    NBLOG(@"[看门狗] 启动（0.2s）");
 }
 
 - (void)watchdogTick {
     if (![self hasAnyReplacement]) return;
-    UIImageView *stage = [self findStageImageView];
-    if (!stage) return;
 
-    if (stage != self.stageView) {
-        NBLOG(@"[看门狗] 舞台视图换了，重新应用");
-        [self applyOverlays];
-        return;
+    // 舞台图还在就用缓存的那个，不要每 0.2s 扫一遍整棵视图树
+    UIImageView *stage = self.stageView;
+    if (!stage || !stage.window) {
+        stage = [self findStageImageView];
+        if (!stage) return;
+        if (stage != self.stageView) {
+            NBLOG(@"[看门狗] 舞台视图换了，重新应用");
+            [self applyOverlays];
+            return;
+        }
     }
     if (self.stageImage && stage.image != self.stageImage) {
         NBLOG(@"[看门狗] 舞台图被重置，重新应用");
@@ -437,10 +468,16 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
             [self applyOverlays];
             return;
         }
+        // 被 App 的 layoutSubviews 压到下面去了 → 拎回最上层
+        if (vv.superview.subviews.lastObject != vv) {
+            [vv.superview bringSubviewToFront:vv];
+            NBLOG(@"[看门狗] 车辆图层被压到下层，已拎回最上");
+        }
         if (!self.adjusting) {
             CGRect want = [self vehicleFrameForCarView:car];
             if (!CGRectEqualToRect(want, vv.frame)) vv.frame = want;
         }
+        // 兜底：万一 setHidden: 没拦住（UIKit 内部直接改 layer.hidden 之类）
         if (!car.hidden && self.carStateSaved) car.hidden = YES;
     }
 }
@@ -610,6 +647,21 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
     return n;
 }
 
+// 图片文件的指纹（大小 + 修改时间）。
+// 为什么需要它：舞台图的 image 每次都是同一个文件名 <slot>.png，
+// 只比「image 指针是不是我上次设的那张」会导致「换了图但不重画」——
+// 换了背景必须重启才生效就是这么来的。比指纹才能真正发现内容变了。
+- (NSString *)stampForPath:(NSString *)p {
+    if (!p.length) return nil;
+    NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:NULL];
+    if (!a) return nil;
+    NSNumber *sz = a[NSFileSize];
+    NSDate *md = a[NSFileModificationDate];
+    if (![sz isKindOfClass:[NSNumber class]]) return nil;
+    return [NSString stringWithFormat:@"%llu|%.4f",
+            sz.unsignedLongLongValue, md ? md.timeIntervalSince1970 : 0.0];
+}
+
 // 车辆图层在「原车视图的 superview」里的 frame。
 // 用 carView.frame（不是 bounds）是因为图层和原车是兄弟视图，同一坐标系。
 - (CGRect)vehicleFrameForCarView:(UIView *)v {
@@ -731,6 +783,9 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
               self.originalCarImage ? NSStringFromCGSize(self.originalCarImage.size) : @"layer");
     }
 
+    // 交给 setHidden: 拦截器保护 —— App 之后任何一次「把它设成可见」都会被当场改回隐藏
+    gNBCarGuard = v;
+
     UIImageView *vv = self.vehicleView;
     vv.image = veh;
     vv.frame = [self vehicleFrameForCarView:v];
@@ -750,12 +805,14 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
 
 - (void)restoreCarViews {
     UIView *v = self.carView;
+    [self.vehicleView removeFromSuperview];
+    self.vehicleView = nil;
+    // 先撤掉拦截再还原 hidden，否则设回 NO 会被自己打回 YES
+    gNBCarGuard = nil;
     if (v && self.carStateSaved) {
         v.hidden = self.carWasHidden;
         v.alpha = self.carWasAlpha;
     }
-    [self.vehicleView removeFromSuperview];
-    self.vehicleView = nil;
     self.carStateSaved = NO;
     self.originalCarImage = nil;
     NBLOG(@"[车视图] 已还原");
@@ -769,6 +826,7 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
         NBLOG(@"[舞台] 已还原原图");
     }
     self.stageImage = nil;
+    self.bgStamp = nil;
 }
 
 - (void)applyOverlays {
@@ -804,11 +862,17 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
     }
 
     // 3) 背景 —— 改写舞台图自己的 image（一直有效的那条路）
+    //    判断依据是「文件指纹 + image 还是不是我上次设的那张」，
+    //    只看指针会漏掉「同一个文件名换了内容」的情况。
     if (stage && bgImg) {
-        if (stage.image != self.stageImage || !self.stageImage) {
+        NSString *stamp = [self stampForPath:bgPath];
+        BOOL same = (self.stageImage != nil) && (stage.image == self.stageImage) &&
+                    (stamp != nil) && (self.bgStamp != nil) && [self.bgStamp isEqualToString:stamp];
+        if (!same) {
             UIImage *img = [self renderStageImage:stage.bounds.size bg:bgImg];
             if (img) {
                 self.stageImage = img;
+                self.bgStamp = stamp;
                 stage.image = img;
                 // 保持 App 自己的 contentMode：下拉怎么动就怎么动，不额外放大
                 if (self.contentModeCaptured) stage.contentMode = self.originalStageContentMode;
