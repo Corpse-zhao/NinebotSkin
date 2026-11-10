@@ -8,7 +8,7 @@
 #import <stdlib.h>
 
 // ============================================================
-// NinebotSkin v0.1.8 —— 九号出行 车辆图/背景图替换（图片版）
+// NinebotSkin v0.1.9 —— 九号出行 车辆图/背景图替换（图片版）
 // 注入目标: cn.ninebot.segway
 //
 // 真机 viewtree(4) 终于把结构钉死了:
@@ -333,6 +333,7 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
 @property (strong, nonatomic) NSMapTable *carOriginals;     // view -> {image/mode/kind/contents/gravity}
 @property (strong, nonatomic) UIImage *originalCarImage;    // 原车图（用于推算主体框，避免自我引用）
 @property (strong, nonatomic) UIImage *vehicleOverlayImage;
+@property (strong, nonatomic) UIImageView *vehicleView;      // 我们自己的车辆图层
 @property (assign, nonatomic) CGRect autoVehRect;           // 从原车主体自动推出来的位置
 
 // 微调
@@ -414,14 +415,14 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
         [self applyOverlays];
         return;
     }
-    // 车视图被 App 换回原图 → 重新贴
-    if (self.vehicleOverlayImage && self.carViews.count) {
+    // 车视图被 App 处理掉 / 被重设了 → 重新贴
+    if (self.carViews.count) {
         UIView *v = self.carViews.firstObject;
-        UIImage *cur = nil;
-        if ([v isKindOfClass:[UIImageView class]]) cur = ((UIImageView *)v).image;
-        if ([v isKindOfClass:[UIImageView class]] && cur != self.vehicleOverlayImage) {
-            NBLOG(@"[看门狗] 车视图被重置，重新贴图");
+        if (!self.vehicleView || self.vehicleView.superview != v.superview || !v.hidden) {
+            NBLOG(@"[看门狗] 车辆图层失效，重新贴");
             [self applyOverlays];
+        } else if (!CGRectEqualToRect(self.vehicleView.frame, v.frame)) {
+            self.vehicleView.frame = v.frame;
         }
     }
 }
@@ -683,7 +684,8 @@ static void NBFillRectWithBand(CGContextRef c, UIImage *src, CGRect rect, CGSize
     while (stack.count) {
         UIView *v = stack.lastObject;
         [stack removeLastObject];
-        if (v != stage && v != self.adjustView && ![v isKindOfClass:[UIWindow class]]) {
+        if (v != stage && v != self.adjustView && v != self.vehicleView &&
+            ![v isKindOfClass:[UIWindow class]]) {
             UIImage *im = nil;
             if ([v isKindOfClass:[UIImageView class]]) im = ((UIImageView *)v).image;
             BOOL has = (im != nil) || (v.layer.contents != nil);
@@ -714,6 +716,8 @@ static void NBFillRectWithBand(CGContextRef c, UIImage *src, CGRect rect, CGSize
         }
         for (UIView *sub in v.subviews) [stack addObject:sub];
     }
+    // 分数太低说明只是普通配图（横幅/缩略图），不能当成车去藏
+    if (bestScore < 15.0) return nil;
     return best;
 }
 
@@ -724,58 +728,77 @@ static void NBFillRectWithBand(CGContextRef c, UIImage *src, CGRect rect, CGSize
 }
 
 - (void)applyVehicleImage:(UIImage *)veh toView:(UIView *)v {
-    if (!v || !veh) return;
+    if (!v || !veh || !v.superview) return;
     if (!self.carOriginals) self.carOriginals = [NSMapTable weakToStrongObjectsMapTable];
+
     UIImage *ov = [self renderVehicleOverlay:veh size:v.bounds.size];
     if (!ov) return;
     self.vehicleOverlayImage = ov;
 
-    NSMutableDictionary *rec = [NSMutableDictionary dictionary];
-    if ([v isKindOfClass:[UIImageView class]]) {
-        UIImageView *iv = (UIImageView *)v;
-        if (![self.carOriginals objectForKey:v]) {
+    if (![self.carOriginals objectForKey:v]) {
+        NSMutableDictionary *rec = [NSMutableDictionary dictionary];
+        rec[@"hidden"] = @(v.hidden);
+        rec[@"alpha"] = @(v.alpha);
+        if ([v isKindOfClass:[UIImageView class]]) {
+            UIImageView *iv = (UIImageView *)v;
             rec[@"kind"] = @"img";
             if (iv.image) rec[@"image"] = iv.image;
             rec[@"mode"] = @(iv.contentMode);
-            [self.carOriginals setObject:rec forKey:v];
             if (iv.image && !self.originalCarImage) self.originalCarImage = iv.image;
-            NBLOG(@"[车视图] 记录原图 %@ mode=%ld",
-                  iv.image ? NSStringFromCGSize(iv.image.size) : @"nil", (long)iv.contentMode);
-        }
-        iv.image = ov;
-        // 车辆层和视图同尺寸，用 AspectFill 只是为了保证 1:1 铺满、不会被拉伸
-        iv.contentMode = UIViewContentModeScaleAspectFill;
-    } else {
-        if (![self.carOriginals objectForKey:v]) {
+        } else {
             rec[@"kind"] = @"layer";
             if (v.layer.contents) rec[@"contents"] = v.layer.contents;
             rec[@"gravity"] = v.layer.contentsGravity ?: @"";
-            [self.carOriginals setObject:rec forKey:v];
-            NBLOG(@"[车视图] 记录 layer contents gravity=%@", v.layer.contentsGravity);
         }
-        v.layer.contents = (__bridge id)ov.CGImage;
-        v.layer.contentsGravity = kCAGravityResizeAspect;
+        [self.carOriginals setObject:rec forKey:v];
+        NBLOG(@"[车视图] 记录 %@ bounds=%@ 原图=%@", NSStringFromClass([v class]),
+              NSStringFromCGRect(v.bounds),
+              rec[@"image"] ? NSStringFromCGSize([(UIImage *)rec[@"image"] size]) : @"-");
     }
+
+    // 贴一层我们自己的车辆视图到同一位置，然后把 App 的车辆视图藏起来。
+    // 为什么"藏"而不是"改 image"：按钮类的图会被 App 在 layout / 状态切换时
+    // 按自己保存的 image 重新设回去，直接改 image 会被反复覆盖，
+    // 表现就是「替换之后过一会儿又变回原车」。
+    if (!self.vehicleView) {
+        UIImageView *vv = [UIImageView new];
+        vv.userInteractionEnabled = NO;                  // 让点击穿透到下面的按钮
+        vv.contentMode = UIViewContentModeScaleToFill;   // 与原位置同尺寸，1:1 贴合
+        vv.backgroundColor = [UIColor clearColor];
+        self.vehicleView = vv;
+    }
+    self.vehicleView.image = ov;
+    self.vehicleView.frame = v.frame;
+    self.vehicleView.autoresizingMask = v.autoresizingMask;
+    if (self.vehicleView.superview != v.superview) {
+        [self.vehicleView removeFromSuperview];
+        [v.superview insertSubview:self.vehicleView aboveSubview:v];
+    }
+    v.hidden = YES;
 }
 
 - (void)restoreCarViews {
-    if (!self.carOriginals) return;
-    for (id key in self.carOriginals) {
-        NSDictionary *rec = [self.carOriginals objectForKey:key];
-        if (![key isKindOfClass:[UIView class]]) continue;
-        UIView *v = (UIView *)key;
-        NSString *kind = rec[@"kind"];
-        if ([kind isEqualToString:@"img"] && [v isKindOfClass:[UIImageView class]]) {
-            UIImageView *iv = (UIImageView *)v;
-            iv.image = rec[@"image"];
-            iv.contentMode = (UIViewContentMode)[rec[@"mode"] integerValue];
-        } else if ([kind isEqualToString:@"layer"]) {
-            v.layer.contents = rec[@"contents"];
-            NSString *g = rec[@"gravity"];
-            if (g.length) v.layer.contentsGravity = g;
+    if (self.carOriginals) {
+        for (id key in self.carOriginals) {
+            if (![key isKindOfClass:[UIView class]]) continue;
+            UIView *v = (UIView *)key;
+            NSDictionary *rec = [self.carOriginals objectForKey:key];
+            if (rec[@"hidden"]) v.hidden = [rec[@"hidden"] boolValue];
+            NSString *kind = rec[@"kind"];
+            if ([kind isEqualToString:@"img"] && [v isKindOfClass:[UIImageView class]]) {
+                UIImageView *iv = (UIImageView *)v;
+                if (rec[@"image"]) iv.image = rec[@"image"];
+                if (rec[@"mode"]) iv.contentMode = (UIViewContentMode)[rec[@"mode"] integerValue];
+            } else if ([kind isEqualToString:@"layer"]) {
+                if (rec[@"contents"]) v.layer.contents = rec[@"contents"];
+                NSString *g = rec[@"gravity"];
+                if (g.length) v.layer.contentsGravity = g;
+            }
         }
+        [self.carOriginals removeAllObjects];
     }
-    [self.carOriginals removeAllObjects];
+    [self.vehicleView removeFromSuperview];
+    self.vehicleView = nil;
     self.vehicleOverlayImage = nil;
     self.originalCarImage = nil;
     NBLOG(@"[车视图] 已还原");
