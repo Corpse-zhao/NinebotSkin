@@ -9,6 +9,9 @@
 #import <math.h>
 #import <stdlib.h>
 
+// Theos SDK 的 AVFoundation 头文件缺失该通知常量声明，手动补上
+extern NSString *const AVPlayerItemDidPlayToEndTime;
+
 // ============================================================
 // NinebotSkin v0.2.0 —— 九号出行 车辆图/背景图替换（图片 + 背景视频）
 // 注入目标: cn.ninebot.segway
