@@ -1,0 +1,4 @@
+#!/bin/sh
+# 安装后杀掉九号出行，让插件注入生效（失败不阻塞安装）
+killall Ninebot 2>/dev/null || true
+exit 0

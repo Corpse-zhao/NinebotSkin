@@ -1,0 +1,135 @@
+name: Build NinebotSkin
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Theos (roothide branch) + SDK
+        run: |
+          brew install make xz ldid
+          git clone --recursive https://github.com/roothide/theos.git $HOME/theos
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git $HOME/theos/sdks-tmp
+          cd $HOME/theos/sdks-tmp && git sparse-checkout set iPhoneOS14.5.sdk
+          mv iPhoneOS14.5.sdk $HOME/theos/sdks/
+          rm -rf $HOME/theos/sdks-tmp
+          ls $HOME/theos/sdks/
+
+      - name: Preflight
+        run: |
+          FAIL=0
+          # control / postinst / plist 必须是 LF
+          for f in control layout/DEBIAN/postinst; do
+            if grep -q $'\r' "$f"; then echo "🛑 $f 含 CRLF"; FAIL=1; fi
+          done
+          # XML plist 可解析
+          python3 - <<'PY'
+          import plistlib, sys
+          for p in ("NinebotSkin.plist",):
+              try:
+                  d = plistlib.load(open(p, "rb"))
+                  assert d["Filter"]["Bundles"] == ["cn.ninebot.segway"], d
+                  print("plist OK:", p)
+              except Exception as e:
+                  print("🛑", p, e); sys.exit(1)
+          PY
+          # 静态检查: Tweak.x 不得 hook NSObject / $ / UIResponder
+          grep -nE '^%hook[[:space:]]+(NSObject|UIResponder)[[:space:]]*$' Tweak.x && FAIL=1
+          grep -nE '^%hook[[:space:]]+\$' Tweak.x && FAIL=1
+          if [ "$FAIL" -ne 0 ]; then echo "🛑 Preflight 未通过"; exit 1; fi
+          exit 0
+
+      - name: Build package
+        env:
+          THEOS: /Users/runner/theos
+        run: |
+          export PATH="$(brew --prefix make)/libexec/gnubin:$PATH"
+          gmake package THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1
+          ls -la packages/
+
+      - name: Verify package
+        run: |
+          python3 - <<'PY'
+          import glob, io, lzma, struct, sys, tarfile
+
+          debs = sorted(glob.glob("packages/*.deb"))
+          if not debs:
+              print("🛑 没有产物"); sys.exit(1)
+          path = debs[-1]
+          print("检查", path)
+          raw = open(path, "rb").read()
+          assert raw[:8] == b"!<arch>\n", "not a deb"
+          off, control_text, payload = 8, None, None
+          while off < len(raw):
+              hdr = raw[off:off + 60]
+              if len(hdr) < 60: break
+              name = hdr[0:16].decode().strip()
+              size = int(hdr[48:58].decode().strip())
+              off += 60
+              body = raw[off:off + size]; off += size + (size % 2)
+              if name.startswith("control.tar"):
+                  with tarfile.open(fileobj=io.BytesIO(body)) as tf:
+                      control_text = tf.extractfile("./control").read().decode()
+              if name.startswith("data.tar"):
+                  payload = body
+          assert control_text, "no control"
+          print(control_text)
+          assert "iphoneos-arm64e" in control_text, "Architecture 不是 arm64e!"
+          assert "Version: 0.1.0" in control_text, "版本号不对"
+
+          # payload: gz / xz / lzma(alone) 全兼容
+          tarbytes = None
+          for opener in (
+              lambda b: tarfile.open(fileobj=io.BytesIO(b), mode="r:gz"),
+              lambda b: tarfile.open(fileobj=io.BytesIO(b), mode="r:xz"),
+              lambda b: tarfile.open(fileobj=lzma.LZMAFile(io.BytesIO(b), format=lzma.FORMAT_ALONE), mode="r:"),
+          ):
+              try:
+                  with opener(payload) as tf:
+                      names = tf.getnames()
+                      dylib = None
+                      for n in names:
+                          if n.endswith(".dylib"):
+                              dylib = tf.extractfile(n).read()
+                      tarbytes = (names, dylib)
+                  break
+              except Exception as e:
+                  continue
+          assert tarbytes, "payload 解不开"
+          names, dylib = tarbytes
+          print("载荷:")
+          for n in sorted(names):
+              if not n.endswith("/"): print("   ", n)
+          assert any("MobileSubstrate/DynamicLibraries" in n for n in names), "缺 dylib"
+          assert any("NinebotSkin.plist" in n for n in names), "缺 filter plist"
+
+          # dylib 双切片: arm64 + arm64e (cputype 相同, cpusubtype 区分)
+          b = dylib
+          assert b[:4] in (b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf"), "dylib 不是 fat"
+          n = struct.unpack(">I", b[4:8])[0]
+          off, subs = 8, []
+          for _ in range(n):
+              ct, cs, o, sz, al = struct.unpack(">IIIII", b[off:off + 20]); off += 20
+              subs.append(cs & 0x00FFFFFF)
+          print("dylib cpusubtypes:", subs)
+          assert 0 in subs and 2 in subs, "缺 arm64/arm64e 切片!"
+
+          # 关键字 (UTF-8 + UTF-16LE 双编码)
+          def has(s):
+              return (s.encode("utf-8") in b) or (s.encode("utf-16-le") in b)
+          for kw in ("cn.ninebot.segway", "0.1.0"):
+              assert has(kw), "dylib 缺关键字 " + kw
+          print("✅ 产物校验全部通过")
+          PY
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NinebotSkin-deb
+          path: packages/*.deb
