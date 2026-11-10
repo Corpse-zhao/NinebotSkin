@@ -1,7 +1,7 @@
 Package: com.corpsezhao.ninebotskin
 Name: NinebotSkin
 Depends: mobilesubstrate
-Version: 0.1.7
+Version: 0.1.8
 Architecture: iphoneos-arm64e
 Description: 九号出行 车辆图/背景图替换（图片版）- roothide
 Author: Corpse-zhao

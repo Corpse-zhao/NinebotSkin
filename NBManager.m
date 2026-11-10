@@ -8,27 +8,22 @@
 #import <stdlib.h>
 
 // ============================================================
-// NinebotSkin v0.1.7 —— 九号出行 车辆图/背景图替换（图片版）
+// NinebotSkin v0.1.8 —— 九号出行 车辆图/背景图替换（图片版）
 // 注入目标: cn.ninebot.segway
 //
-// v0.1.7 的关键认知修正（v0.1.5/0.1.6 都栽在这里）:
-//   原车**不在**舞台图里！真机截图证明舞台上还叠着一层"原车模型"。
-//   所以把车合成进舞台图，等于在 App 自己的车下面又画了一台，
-//   表现为「两台车重叠」「原车盖在替换图上面」「白块露在车后面」。
+// 真机 viewtree(4) 终于把结构钉死了:
+//   NBBaseUIKit.MotorDetailShortCutsCell {430, 666.67}
+//     UIView {0, 103}, {430, 563.67}
+//       UIButton {76.67, 106.33}, {276.67, 242}     <- 爱车按钮（点击进车辆详情）
+//         UIImageView {0, 0}, {276.67, 242} img=Y   <- **原车就是这张图**
+//       QGVAPWrapView {0, 0}, {430, 441.33}         <- ninebot 水印动画（VAP）
+//   舞台上那三个同尺寸 UIImageView 里，只有一个是我换的背景层，另外两个是备用图。
 //
-//   现在的分工:
-//     · 舞台图（背景层）→ 只负责背景图替换，绝不掺车辆，也绝不画白色遮罩
-//     · 车视图（原车那一层，与舞台同尺寸的可见图层）→ 直接换掉它的 image
-//   换车视图的 image 有个大好处：位置、缩放、下拉时的行为全部继承 App 自己的逻辑，
-//   不需要我们猜。叠加时再按「原车主体包围盒」自动定位，导入即对齐。
-//
-// 页面结构（真机 viewtree ×4 实测，430×932）:
-//   OuterScrollView(932, 会滚动) → UIView(430×983)
-//       UIView(430×983, bg=Y)                       <- 舞台宿主
-//         UIImageView {0,0,430,441.47}              <- 背景层
-//         UIImageView ×N 同尺寸                      <- 原车模型所在的图层
-//         UIView {0,391,430,50}
-//         UITableView {0,0,430,900}                 <- 卡片列表，自己的滚动
+// 所以：车辆替换 = 直接换「爱车按钮里的那个 UIImageView」的 image。
+//   位置、缩放、下拉时的行为、点击事件，全部由 App 自己的布局驱动，
+//   不需要我算坐标、不需要白块遮原车、也不会被拉伸。
+//   替换图层尺寸 = 原车图层尺寸，画的时候用「原车图的不透明主体包围盒」定位，
+//   导入即对齐原车，且不随窗口变化。
 // ============================================================
 
 static NSString * const kTargetBundle = @"cn.ninebot.segway";
@@ -336,6 +331,7 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
 // 车视图（独立图层，浮在舞台之上）
 @property (copy,   nonatomic) NSArray<UIView *> *carViews;
 @property (strong, nonatomic) NSMapTable *carOriginals;     // view -> {image/mode/kind/contents/gravity}
+@property (strong, nonatomic) UIImage *originalCarImage;    // 原车图（用于推算主体框，避免自我引用）
 @property (strong, nonatomic) UIImage *vehicleOverlayImage;
 @property (assign, nonatomic) CGRect autoVehRect;           // 从原车主体自动推出来的位置
 
@@ -598,14 +594,31 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
                       n.size.width * sz.width, n.size.height * sz.height);
 }
 
-// 车视图坐标系里的一屏尺寸（车挂在车视图上时就是车视图的 bounds）
-- (CGSize)vehicleSpaceSize {
-    UIView *v = self.carViews.count ? self.carViews.firstObject : nil;
-    if (v && v.bounds.size.width > 1) return v.bounds.size;
-    return self.stageView ? self.stageView.bounds.size : CGSizeZero;
-}
-
 #pragma mark - 舞台图（只负责背景）
+// 用「框外紧邻的一条横带」纵向拉伸盖住 rect —— 比纯白色块自然得多。
+// 只在「找不到车视图、只能把车画进舞台」的兜底路径里用。
+static void NBFillRectWithBand(CGContextRef c, UIImage *src, CGRect rect, CGSize sz) {
+    if (!src || CGRectIsEmpty(rect) || sz.height < 1) return;
+    CGImageRef cg = src.CGImage;
+    if (!cg) return;
+    size_t w = CGImageGetWidth(cg), h = CGImageGetHeight(cg);
+    if (!w || !h) return;
+    CGFloat bandY = (CGRectGetMaxY(rect) + 8.0 < sz.height) ? (CGRectGetMaxY(rect) + 2.0)
+                                                            : MAX(0.0, rect.origin.y - 4.0);
+    CGFloat bandH = MAX(2.0, sz.height * 0.008);
+    CGRect bandPx = CGRectMake(0, bandY / sz.height * (CGFloat)h,
+                               (CGFloat)w, MAX(2.0, bandH / sz.height * (CGFloat)h));
+    bandPx = CGRectIntersection(bandPx, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h));
+    if (CGRectIsNull(bandPx) || bandPx.size.height < 1) return;
+    CGImageRef band = CGImageCreateWithImageInRect(cg, bandPx);
+    if (!band) return;
+    UIImage *bi = [UIImage imageWithCGImage:band];
+    CGContextSaveGState(c);
+    CGContextClipToRect(c, rect);
+    [bi drawInRect:rect];
+    CGContextRestoreGState(c);
+    CGImageRelease(band);
+}
 
 - (UIImage *)renderStageImage:(CGSize)sz bg:(UIImage *)bg veh:(UIImage *)veh {
     if (sz.width < 1 || sz.height < 1) return nil;
@@ -615,7 +628,7 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
     fmt.scale = 3.0;
     UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:sz format:fmt];
     UIImage *orig = self.originalStageImage;
-    CGRect vr = [self vehicleRectInSize:[self vehicleSpaceSize]];
+    CGRect vr = [self vehicleRectInSize:sz];
     UIImage *out = [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
         CGContextRef c = ctx.CGContext;
         [[UIColor whiteColor] setFill];
@@ -625,9 +638,11 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
         } else if (orig) {
             NBDrawImage(c, orig, CGRectMake(0, 0, sz.width, sz.height), YES);
         }
-        // 注意：这里不再画任何白色遮罩块 —— 原车不在舞台图里，
-        // 之前那块纯白正是"背后一圈白底"的来源。
-        if (veh) NBDrawImage(c, veh, vr, NO);
+        if (veh) {
+            // 兜底路径：原车还在原图里，用邻近色带盖掉（绝不画纯白块）
+            if (!bg && orig) NBFillRectWithBand(c, orig, vr, sz);
+            NBDrawImage(c, veh, vr, NO);
+        }
     }];
     NBLOG(@"[合成] 舞台 %@ bg=%d veh=%d vehRect=%@", NSStringFromCGSize(sz),
           bg != nil, veh != nil, NSStringFromCGRect(vr));
@@ -651,31 +666,61 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
 
 #pragma mark - 车视图（原车所在的独立图层）
 
-// 全窗口找「和舞台同尺寸、可见、带图像」的视图 —— 就是 App 画原车的那一层
-- (NSArray<UIView *> *)visibleCarViewsForStage:(UIImageView *)stage {
-    NSMutableArray<UIView *> *out = [NSMutableArray array];
+// 原车在真机上的真实结构（viewtree 实测）:
+//   UIButton {{76.67, 106.33}, {276.67, 242}}
+//     UIImageView {{0, 0}, {276.67, 242}} img=Y      <- 就是它，点击进车辆详情
+// 所以不能靠"和舞台同尺寸"去找，要靠"在 UIControl 里 + 尺寸合理 + 带透明通道"打分。
+- (UIView *)findCarViewForStage:(UIView *)stage {
     UIWindow *win = [self appMainWindow];
-    if (!win || !stage) return out;
-    CGSize s = stage.bounds.size;
-    if (s.width < 1) return out;
-    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:win.rootViewController.view];
+    if (!win || !win.rootViewController) return nil;
+    UIView *root = win.rootViewController.view;
+    CGFloat screenArea = win.bounds.size.width * win.bounds.size.height;
+    if (screenArea < 1) return nil;
+
+    UIView *best = nil;
+    CGFloat bestScore = 0;
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
     while (stack.count) {
         UIView *v = stack.lastObject;
         [stack removeLastObject];
-        if (v == stage || v == self.adjustView) continue;
-        if (v != self.ballWindow && ![v isKindOfClass:[UIWindow class]]) {
-            CGSize b = v.bounds.size;
-            BOOL same = (fabs(b.width - s.width) <= 8.0 && fabs(b.height - s.height) <= 8.0);
-            if (same && !v.hidden && v.alpha > 0.05) {
-                BOOL has = NO;
-                if ([v isKindOfClass:[UIImageView class]]) has = (((UIImageView *)v).image != nil);
-                else has = (v.layer.contents != nil);
-                if (has) [out addObject:v];
+        if (v != stage && v != self.adjustView && ![v isKindOfClass:[UIWindow class]]) {
+            UIImage *im = nil;
+            if ([v isKindOfClass:[UIImageView class]]) im = ((UIImageView *)v).image;
+            BOOL has = (im != nil) || (v.layer.contents != nil);
+            if (has && !v.hidden && v.alpha > 0.05) {
+                CGSize b = v.bounds.size;
+                CGFloat area = b.width * b.height;
+                if (b.width >= 60.0 && b.height >= 50.0 &&
+                    area >= screenArea * 0.03 && area <= screenArea * 0.60) {
+                    CGFloat score = 1.0 + area / screenArea;
+                    // 在可点击控件里 => 极可能就是"爱车"
+                    for (UIView *p = v.superview; p && p != root; p = p.superview) {
+                        if ([p isKindOfClass:[UIControl class]]) { score += 100.0; break; }
+                    }
+                    // 与舞台同尺寸 => 也是候选（旧结构）
+                    if (stage) {
+                        CGSize s = stage.bounds.size;
+                        if (fabs(b.width - s.width) < 8.0 && fabs(b.height - s.height) < 8.0) score += 20.0;
+                    }
+                    // 带透明通道（车是抠图）=> 加分
+                    if (im) {
+                        CGRect nb = NBAlphaNormalizedBounds(im);
+                        if (!CGRectIsEmpty(nb) &&
+                            (nb.size.width < 0.96 || nb.size.height < 0.96)) score += 40.0;
+                    }
+                    if (score > bestScore) { bestScore = score; best = v; }
+                }
             }
         }
         for (UIView *sub in v.subviews) [stack addObject:sub];
     }
-    return out;
+    return best;
+}
+
+// 兼容旧接口：0 或 1 个
+- (NSArray<UIView *> *)visibleCarViewsForStage:(UIImageView *)stage {
+    UIView *v = [self findCarViewForStage:stage];
+    return v ? @[v] : @[];
 }
 
 - (void)applyVehicleImage:(UIImage *)veh toView:(UIView *)v {
@@ -693,6 +738,7 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
             if (iv.image) rec[@"image"] = iv.image;
             rec[@"mode"] = @(iv.contentMode);
             [self.carOriginals setObject:rec forKey:v];
+            if (iv.image && !self.originalCarImage) self.originalCarImage = iv.image;
             NBLOG(@"[车视图] 记录原图 %@ mode=%ld",
                   iv.image ? NSStringFromCGSize(iv.image.size) : @"nil", (long)iv.contentMode);
         }
@@ -731,6 +777,7 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
     }
     [self.carOriginals removeAllObjects];
     self.vehicleOverlayImage = nil;
+    self.originalCarImage = nil;
     NBLOG(@"[车视图] 已还原");
 }
 
@@ -763,12 +810,16 @@ static void NBDrawImage(CGContextRef c, UIImage *img, CGRect rect, BOOL fill) {
         UIView *c0 = self.carViews.firstObject;
         UIImage *carImg = nil;
         if ([c0 isKindOfClass:[UIImageView class]]) carImg = ((UIImageView *)c0).image;
-        CGRect nb = carImg ? NBAlphaNormalizedBounds(carImg) : CGRectZero;
+        // 用记录下来的原车图算主体框，别用我们自己贴上去的图（否则会自我引用越缩越小）
+        UIImage *forMeasure = self.originalCarImage ?: carImg;
+        CGRect nb = forMeasure ? NBAlphaNormalizedBounds(forMeasure) : CGRectZero;
         if (!CGRectIsEmpty(nb)) self.autoVehRect = nb;
-        NBLOG(@"[车视图] %lu 个，首个=%@ 原图=%@ 主体框=%@", (unsigned long)self.carViews.count,
-              NSStringFromClass([c0 class]),
+        NBLOG(@"[车视图] %lu 个，首个=%@ bounds=%@ 原图=%@ 主体框=%@", (unsigned long)self.carViews.count,
+              NSStringFromClass([c0 class]), NSStringFromCGRect(c0.bounds),
               carImg ? NSStringFromCGSize(carImg.size) : @"nil",
               CGRectIsEmpty(nb) ? @"nil" : NSStringFromCGRect(nb));
+    } else {
+        NBLOG(@"[车视图] 没找到，走兜底（画进舞台）");
     }
 
     BOOL onCarView = (self.carViews.count > 0 && vehImg != nil);
