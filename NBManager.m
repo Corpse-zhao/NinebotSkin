@@ -5,6 +5,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <unistd.h>
 #import <math.h>
 #import <stdlib.h>
@@ -23,13 +24,10 @@ static CMTime NBCMZero(void) {
     return t;
 }
 
-// Theos SDK 头文件缺失这两个类工厂方法声明，手动补上（仅编译期，运行时走 objc_getClass）
-@interface AVAsset (NBSkinDecl)
-+ (instancetype)assetWithURL:(NSURL *)URL;
-@end
-@interface AVAssetImageGenerator (NBSkinDecl)
-+ (instancetype)assetImageGeneratorWithAsset:(AVAsset *)asset;
-@end
+// 带一个对象参数的消息发送（绕开 Theos SDK 缺失的类工厂方法声明）
+static id NBMsgSend1(id rcv, SEL sel, id arg) {
+    return ((id (*)(id, SEL, id))objc_msgSend)(rcv, sel, arg);
+}
 
 // ============================================================
 // NinebotSkin v0.2.0 —— 九号出行 车辆图/背景图替换（图片 + 背景视频）
@@ -1810,8 +1808,8 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
             dispatch_async(dispatch_get_main_queue(), ^{ if (cb) cb(nil, NO); });
             return;
         }
-        AVAsset *asset = [(AVAsset *)assetCls assetWithURL:[NSURL fileURLWithPath:path]];
-        AVAssetImageGenerator *gen = [(AVAssetImageGenerator *)genCls assetImageGeneratorWithAsset:asset];
+        AVAsset *asset = NBMsgSend1(assetCls, @selector(assetWithURL:), [NSURL fileURLWithPath:path]);
+        AVAssetImageGenerator *gen = NBMsgSend1(genCls, @selector(assetImageGeneratorWithAsset:), asset);
         gen.appliesPreferredTrackTransform = YES;
         gen.maximumSize = CGSizeMake(1600.0, 1600.0);
         CMTime at = NBCMZero();
