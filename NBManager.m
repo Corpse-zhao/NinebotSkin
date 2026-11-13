@@ -870,6 +870,8 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
                                          handler:^(UIAlertAction *action){ [weakSelf oneKeyRestore]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"调试：导出视图树" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *action){ [weakSelf dumpViewTree]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"调试：投屏/主题诊断" style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *action){ [weakSelf diagnoseProjectionAndTheme]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel
                                          handler:^(UIAlertAction *action){ [weakSelf unhideBall]; }]];
 
@@ -1924,8 +1926,105 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     NBLOG(@"[调试] 导出 %lu 字节", (unsigned long)out.length);
 }
 
-- (void)dump:(UIView *)view to:(NSMutableString *)out depth:(NSInteger)depth {
-    if (!view || depth > 16) return;
+// 诊断：投屏（外部屏）+ App 里的仪表主题/壁纸资源。
+// 目的：确认「导航息屏投屏」是系统外部屏还是 App 自己截屏发送，
+// 以及官方主题包/壁纸在沙盒里长什么样（格式、尺寸、命名），为自定义壁纸铺路。
+- (void)diagnoseProjectionAndTheme {
+    NSMutableString *out = [NSMutableString stringWithCapacity:16384];
+    [out appendFormat:@"==== NinebotSkin %@ 诊断 %@ ====\n", NB_VERSION, [NSDate date]];
+    [out appendFormat:@"bundle=%@\nhome=%@\n", [[NSBundle mainBundle] bundleIdentifier], NSHomeDirectory()];
+
+    // ---------- 屏幕 ----------
+    NSArray<UIScreen *> *screens = [UIScreen screens];
+    [out appendFormat:@"\n[UIScreen.screens] count=%lu\n", (unsigned long)screens.count];
+    for (UIScreen *s in screens) {
+        [out appendFormat:@"  bounds=%@ native=%@ scale=%.2f brightness=%.2f mirrored=%@\n",
+         NSStringFromCGRect(s.bounds), NSStringFromCGRect(s.nativeBounds), s.scale, s.brightness,
+         s.mirroredScreen ? NSStringFromCGRect(s.mirroredScreen.bounds) : @"nil"];
+    }
+
+    // ---------- 窗口场景 ----------
+    [out appendString:@"\n[UIWindowScene]\n"];
+    for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *ws = (UIWindowScene *)sc;
+        [out appendFormat:@"  scene=%@ activation=%ld windows=%lu\n",
+         NSStringFromCGRect(ws.coordinateSpace.bounds), (long)ws.activationState,
+         (unsigned long)ws.windows.count];
+        for (UIWindow *w in ws.windows) {
+            [out appendFormat:@"    win %@ level=%.0f bounds=%@ hidden=%d\n",
+             NSStringFromClass([w class]), w.windowLevel, NSStringFromCGRect(w.bounds), (int)w.hidden];
+        }
+    }
+
+    // ---------- 投屏相关框架是否加载 ----------
+    NSArray<NSString *> *probe = @[@"RPBroadcastSampleHandler", @"ReplayKit", @"MPExternalDisplay",
+                                   @"AirPlaySender", @"NinebotMirror", @"Mirror", @"Projection",
+                                   @"CarPlay", @"ScreenCast", @"Cast"];
+    [out appendString:@"\n[已加载的投屏/镜像相关类]\n"];
+    for (NSString *name in probe) {
+        if (objc_getClass(name.UTF8String)) [out appendFormat:@"  %@ = YES\n", name];
+    }
+
+    // ---------- 沙盒里的主题/壁纸资源 ----------
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray<NSString *> *kw = @[@"theme", @"wallpaper", @"skin", @"instrument", @"dashboard",
+                                @"meter", @"panel", @"clock", @"ridey", @"表盘", @"仪表"];
+    NSMutableArray<NSString *> *hits = [NSMutableArray array];
+    NSString *dumpDir = [NBLogDir() stringByAppendingPathComponent:@"theme_dump"];
+    [fm createDirectoryAtPath:dumpDir withIntermediateDirectories:YES attributes:nil error:NULL];
+    unsigned long long copied = 0;
+    NSUInteger seq = 0;
+    NSArray<NSString *> *roots = @[@"Documents", @"Library", @"tmp"];
+    for (NSString *r in roots) {
+        NSString *rootPath = [NSHomeDirectory() stringByAppendingPathComponent:r];
+        NSDirectoryEnumerator<NSString *> *en = [fm enumeratorAtPath:rootPath];
+        for (NSString *rel in en) {
+            NSString *lower = rel.lowercaseString;
+            BOOL hit = NO;
+            for (NSString *k in kw) {
+                if ([lower containsString:k]) { hit = YES; break; }
+            }
+            if (!hit) continue;
+            NSString *full = [rootPath stringByAppendingPathComponent:rel];
+            NSDictionary *at = [fm attributesOfItemAtPath:full error:NULL];
+            if (![at[NSFileType] isEqual:NSFileTypeRegular]) continue;
+            unsigned long long sz = [at[NSFileSize] unsignedLongLongValue];
+            if (sz > 24ULL * 1024ULL * 1024ULL) continue;
+            [hits addObject:[NSString stringWithFormat:@"%@ | %llu B", full, sz]];
+            // 小文件顺手拷一份出来，方便直接看格式
+            if (copied + sz <= 40ULL * 1024ULL * 1024ULL && hits.count <= 150) {
+                NSString *name = rel.lastPathComponent;
+                if (!name.length) continue;
+                NSString *dst = [dumpDir stringByAppendingPathComponent:
+                                 [NSString stringWithFormat:@"%03lu_%@", (unsigned long)seq, name]];
+                if ([fm copyItemAtPath:full toPath:dst error:NULL]) {
+                    copied += sz;
+                    seq += 1;
+                }
+            }
+        }
+    }
+    [out appendFormat:@"\n[沙盒主题/壁纸资源] 命中 %lu 个\n", (unsigned long)hits.count];
+    for (NSString *line in hits) [out appendFormat:@"  %@\n", line];
+    [out appendFormat:@"\n已拷贝 %lu 个文件（共 %llu B）到：%@\n",
+     (unsigned long)seq, copied, dumpDir];
+
+    // ---------- 主题页当前视图（如果此刻正停在主题页，能抓到列表的资源名） ----------
+    UIWindow *win = [self appMainWindow];
+    if (win) {
+        [out appendString:@"\n[当前顶层视图树]\n"];
+        [self dump:win.rootViewController.view to:out depth:0];
+    }
+
+    NSString *path = [NBLogDir() stringByAppendingPathComponent:@"diagnose.txt"];
+    [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+    [self alertDone:[NSString stringWithFormat:@"诊断已导出：\n%@\n\n同目录 theme_dump/ 里是抓到的主题资源", path]];
+    NBLOG(@"[诊断] 屏幕 %lu 块，主题命中 %lu 个，导出 %lu 字节",
+          (unsigned long)screens.count, (unsigned long)hits.count, (unsigned long)out.length);
+}
+
+- (void)dump:(UIView *)view to:(NSMutableString *)out depth:(NSInteger)depth {    if (!view || depth > 16) return;
     [out appendFormat:@"%@%@ frame=%@ alpha=%.2f hidden=%d bg=%@ img=%@ %@\n",
      [@"" stringByPaddingToLength:depth * 2 withString:@" " startingAtIndex:0],
      NSStringFromClass([view class]),
