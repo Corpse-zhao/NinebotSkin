@@ -810,10 +810,17 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     // 背景视频：只在设备页播（离开 = 暂停+摘层，回来 = 重挂续播）；
     // 播到结尾就 seek 回开头重播；只是暂停就续上。
     // ⚠️ 声音不依赖图层挂在哪 —— 之前切到别的 tab 看门狗还在维持播放，这就是"别的界面还有声音"的根因。
+    // ⚠️ 退后台/锁屏/下拉控制中心时 mustPlay = NO：暂停后绝不能再被这里 play() 拉回来。
     {
         UIImageView *sv = self.stageView;
         BOOL onPage = sv && sv.window && sv.superview && [self stageOnDevicePage:sv];
-        if (!onPage) {
+        BOOL mustPlay = [self shouldPlayVideo];
+        if (!mustPlay) {
+            if (self.bgPlayer && self.bgPlayer.rate != 0.0) {
+                [self.bgPlayer pause];
+                NBLOG(@"[看门狗] App 不在前台/key，视频暂停（不恢复）");
+            }
+        } else if (!onPage) {
             if (self.bgPlayer && self.bgPlayer.rate != 0.0) {
                 [self.bgPlayer pause];
                 NBLOG(@"[看门狗] 不在设备页，视频暂停");
@@ -1735,6 +1742,18 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 //   · frame 跟随「背景显示方式」：整个上半屏 = 舞台全幅；车控区域 = 只铺那一块
 //   · 播完 seek 回开头循环；默认静音，可在菜单里开声音（不占系统音频会话的额外配置）
 
+// 是否允许背景视频出声/播放：
+//   · App 必须处于前台 active
+//   · 主 window 必须是 key window（下拉控制中心/通知中心会抢走 key，锁屏/退后台也会失去）
+// 不加这层闸，onResignActive 里刚暂停的播放器会被看门狗 0.2s 后自己 play() 恢复
+// —— 这就是「退出 App 还有两三秒声音」的真正原因。
+- (BOOL)shouldPlayVideo {
+    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return NO;
+    UIWindow *w = [self appMainWindow];
+    if (w && !w.isKeyWindow) return NO;
+    return YES;
+}
+
 // 背景视频是否有声。默认静音（未设置 = NO）。
 - (BOOL)bgVideoSoundOn {
     return [[NSUserDefaults standardUserDefaults] boolForKey:kKeyBgVideoSound];
@@ -1838,7 +1857,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     CGRect region = [self bgRegionInSize:stage.bounds.size];
     CGRect inSuper = [stage convertRect:region toView:stage.superview];
     if (!CGRectEqualToRect(self.bgLayer.frame, inSuper)) self.bgLayer.frame = inSuper;
-    if (self.bgPlayer.rate == 0.0) [self.bgPlayer play];
+    if (self.bgPlayer.rate == 0.0 && [self shouldPlayVideo]) [self.bgPlayer play];
 }
 
 // 播完 seek 回开头，实现无缝续播（不用 AVPlayerLooper：这个 Theos SDK 里没有它的声明）
@@ -1851,7 +1870,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     [self.bgPlayer seekToTime:z
               toleranceBefore:z
                toleranceAfter:z];
-    [self.bgPlayer play];
+    if ([self shouldPlayVideo]) [self.bgPlayer play];   // 后台时不重播，回前台看门狗会接上
     NBLOG(@"[视频] 重播");
 }
 
