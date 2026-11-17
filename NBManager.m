@@ -684,6 +684,12 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
                                              selector:@selector(onForeground)
                                                  name:UIApplicationDidBecomeActiveNotification
                                                object:nil];
+    // 退后台瞬间主动暂停视频：否则系统挂起流程有一两秒宽限，声音会多响一会儿
+    // （回前台后看门狗发现 rate==0 会自动续播，无需额外恢复逻辑）
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(onResignActive)
+                                                 name:UIApplicationWillResignActiveNotification
+                                               object:nil];
 }
 
 // 接管 -[UIView setHidden:]，用来「原车图被设回可见」时同步纠正（见文件上方 NBCarSetHidden）
@@ -698,6 +704,15 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 - (void)onForeground {
     [self applyOverlays];
     [self scheduleReapply];
+}
+
+// 即将离开前台（按 Home / 切 App / 锁屏）：立即暂停背景视频，声音零延迟消失。
+// 回到前台后看门狗每 0.2s 检查 rate==0 → play，自动续播。
+- (void)onResignActive {
+    if (self.bgPlayer && self.bgPlayer.rate != 0.0) {
+        [self.bgPlayer pause];
+        NBLOG(@"[视频] App 退后台，立即暂停");
+    }
 }
 
 - (void)setupRound:(NSInteger)round {
