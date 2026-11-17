@@ -779,12 +779,24 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
         if (!car.hidden && self.carStateSaved) car.hidden = YES;
     }
 
-    // 背景视频：层被摘了就重挂；播到结尾就 seek 回开头重播；只是暂停就续上
-    if (self.bgLayer) {
+    // 背景视频：只在设备页播（离开 = 暂停+摘层，回来 = 重挂续播）；
+    // 播到结尾就 seek 回开头重播；只是暂停就续上。
+    // ⚠️ 声音不依赖图层挂在哪 —— 之前切到别的 tab 看门狗还在维持播放，这就是"别的界面还有声音"的根因。
+    {
         UIImageView *sv = self.stageView;
-        if (sv && sv.superview) {
-            if (self.bgLayer.superlayer != sv.superview.layer) {
-                NBLOG(@"[看门狗] 视频层掉了，重挂");
+        BOOL onPage = sv && sv.window && sv.superview && [self stageOnDevicePage:sv];
+        if (!onPage) {
+            if (self.bgPlayer && self.bgPlayer.rate != 0.0) {
+                [self.bgPlayer pause];
+                NBLOG(@"[看门狗] 不在设备页，视频暂停");
+            }
+            if (self.bgLayer && self.bgLayer.superlayer) [self.bgLayer removeFromSuperlayer];
+        } else if ([self hasBgVideo]) {
+            if (!self.bgLayer || !self.bgLayer.superlayer) {
+                NBLOG(@"[看门狗] 设备页但视频层缺失，重挂");
+                [self applyVideoLayer];
+            } else if (self.bgLayer.superlayer != sv.superview.layer) {
+                NBLOG(@"[看门狗] 视频层挂错位置，重挂");
                 [self applyVideoLayer];
             } else if ([self bgVideoAtEnd]) {
                 [self restartBgVideo];
@@ -920,6 +932,27 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 
 #pragma mark - 舞台图定位
 
+// 舞台图只允许出现在「设备」tab 页。
+// viewtree 证据：舞台图祖先是 NBBaseUIKit.MotorDetailShortCutsCell，所在 VC 是 DeviceSegmentVC。
+// 其他 tab（我的/服务/发现/商城）顶部也有宽大图，纯按尺寸扫会误命中 ——
+// v0.2.7 视频背景泄漏到「我的/服务」页的根因就是少了这道验证。
+- (BOOL)stageOnDevicePage:(UIView *)view {
+    if (!view) return NO;
+    for (UIView *v = view; v; v = v.superview) {
+        NSString *cn = NSStringFromClass([v class]);
+        if ([cn containsString:@"MotorDetail"] || [cn containsString:@"DeviceSegment"]) return YES;
+    }
+    // 响应链上的 VC 类名兜底
+    for (UIResponder *r = view; r; r = r.nextResponder) {
+        if ([r isKindOfClass:[UIViewController class]]) {
+            NSString *cn = NSStringFromClass([r class]);
+            if ([cn containsString:@"Device"] || [cn containsString:@"Motor"]) return YES;
+            break;
+        }
+    }
+    return NO;
+}
+
 - (UIImageView *)findStageImageView {
     UIWindow *win = [self appMainWindow];
     if (!win || !win.rootViewController.view) return nil;
@@ -936,6 +969,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
             if (iv.image && !iv.hidden &&
                 b.width >= ws.width * 0.85 &&
                 b.height >= ws.height * 0.20 && b.height <= ws.height * 0.65) {
+                if (![self stageOnDevicePage:iv]) continue;   // 只认设备页，其他 tab 的大图一律不要
                 if (!best || b.height > best.bounds.size.height) best = iv;
             }
         }
@@ -1732,8 +1766,15 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 
 - (void)applyVideoLayer {
     UIImageView *stage = self.stageView;
-    if (!stage || !stage.superview || ![self hasBgVideo]) {
-        [self teardownVideoLayer];
+    // 只在设备页播：画面和声音都不能泄漏到其他 tab（v0.2.7 用户反馈问题2/3）。
+    // 不满足时暂停+摘层，但保留 player（重建要重新打开文件，慢）；回到设备页看门狗会续播。
+    BOOL onPage = stage && stage.window && stage.superview && [self stageOnDevicePage:stage];
+    if (!onPage || ![self hasBgVideo]) {
+        if (self.bgPlayer && self.bgPlayer.rate != 0.0) {
+            [self.bgPlayer pause];
+            NBLOG(@"[视频] 不在设备页，暂停");
+        }
+        if (self.bgLayer && self.bgLayer.superlayer) [self.bgLayer removeFromSuperlayer];
         return;
     }
     NSString *vpath = [[NSUserDefaults standardUserDefaults] stringForKey:kKeyBgVideoPath];
@@ -1852,6 +1893,9 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
             }
             NSString *dst = [NBLogDir() stringByAppendingPathComponent:@"bg_video.mov"];
             [[NSUserDefaults standardUserDefaults] setObject:dst forKey:kKeyBgVideoPath];
+            // 路径永远是 bg_video.mov：按「路径变了没」判断会漏掉「换了内容」——
+            // 必须强制销毁旧 player，下次 applyVideoLayer 才会加载新文件（换视频不用重启 App）
+            [self teardownVideoLayer];
             [self applyOverlays];        // 里面会挂视频层
             [self scheduleReapply];
             NSString *modeNote = ([self bgMode] == 0) ? @"整个上半屏" : @"车控区域";
