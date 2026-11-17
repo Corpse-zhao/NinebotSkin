@@ -1,6 +1,6 @@
 #import <Foundation/Foundation.h>
 
-#define NB_VERSION @"0.2.8"
+#define NB_VERSION @"0.2.9"
 
 @interface NBManager : NSObject
 + (instancetype)shared;

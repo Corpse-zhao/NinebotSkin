@@ -61,6 +61,11 @@ static NSString * const kKeyBgVideoSound = @"nbskin_bg_video_sound"; // 背景�
 // 舞台高 441.47；cell 内容区从 y=103 起（「车控」标题那一行）→ 103 / 441.47 ≈ 0.2333
 static CGFloat const kBgRegionTop = 0.2333;
 
+// 充电条竖放目标位置（相对其父容器坐标；容器顶 ≈ 屏幕车控区顶部 y≈103）。
+// 用户红框：屏幕 y≈245~390 → 中心 ≈316 → 容器内 ≈213。
+static CGFloat const kChargeBarCenterY = 214.0;
+static CGFloat const kChargeBarEdge    = 2.0;   // 距屏幕左边缘的边距
+
 // ---------- 日志 ----------
 static NSString *NBLogDir(void) {
     static NSString *dir = nil;
@@ -629,6 +634,10 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 @property (strong, nonatomic) AVPlayerLayer *bgLayer;
 @property (copy,   nonatomic) NSString *bgVideoPath;
 
+// 充电条（充电时带 SVGA 动画的大电池进度条）挪位维护
+@property (weak,   nonatomic) UIView *chargeBarView;
+@property (assign, nonatomic) NSTimeInterval lastChargeBarScan;   // 扫描节流
+
 // 车：原车视图（只用来定位 / 当挂载点）+ 我们贴上去的车辆图层
 @property (weak,   nonatomic) UIView *carView;             // 爱车按钮里的那个 UIImageView
 @property (strong, nonatomic) UIImageView *vehicleView;    // 我们自己贴的车辆图层（挂在 carView.superview 最上层）
@@ -719,6 +728,8 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 }
 
 - (void)watchdogTick {
+    // 充电条挪位：独立于背景/车辆替换，即使什么都没换也要维护
+    [self maintainChargeBar];
     // 有"待还原"时，即使已经没有替换内容也要继续跑，否则背景会一直卡在合成图上
     if (self.pendingStageRestore) {
         UIImageView *s = self.stageView ?: [self findStageImageView];
@@ -1845,6 +1856,75 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     return cs >= ds - 0.12;
 }
 
+#pragma mark - 充电条挪位
+// 充电时 App 会在车辆上方显示一块带 SVGA 动画的大电池进度条（76% 那块），
+// 画在车按钮之下（= 视觉上被车压着）。用户要求把它挪到屏幕左边缘竖放。
+// viewtree(7) 钉死其身份：UIImageView{87.7,113.7,254.7×101} alpha=0.8，
+// 子视图含 2×SVGAPlayer + 数字/百分号两个 UILabel，充电时才出现。
+//
+// 关键实现：不动 frame/center，把「平移 + 旋转90°」全部写进 transform ——
+// 自动布局重设 frame 时 transform 平移分量仍然生效，视图不会被拉回去、不闪；
+// 还原只需 transform = Identity（center 从未被改过，自动回原位）。
+
+// 全窗口扫描充电条：UIImageView、宽 200~330、高 80~130、带 SVGAPlayer 子视图。
+- (UIView *)scanChargeBarView {
+    UIWindow *win = [self appMainWindow];
+    if (!win || !win.rootViewController.view) return nil;
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:win.rootViewController.view];
+    while (stack.count) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        if (v != self.vehicleView &&
+            !v.hidden && v.alpha > 0.5 &&
+            [v isKindOfClass:[UIImageView class]]) {
+            CGSize b = v.bounds.size;
+            if (b.width >= 200 && b.width <= 330 && b.height >= 80 && b.height <= 130) {
+                for (UIView *s in v.subviews) {
+                    if ([NSStringFromClass([s class]) containsString:@"SVGAPlayer"]) return v;
+                }
+            }
+        }
+        for (UIView *s in v.subviews) [stack addObject:s];
+    }
+    return nil;
+}
+
+// 看门狗每 tick 调：找到充电条就套挪位 transform；被 App 重置就补。
+// 没在充电时 5 秒节流一次扫描，平时 O(1) 不扫树。
+- (void)maintainChargeBar {
+    UIView *bar = self.chargeBarView;
+    BOOL valid = bar && bar.window && bar.superview && !bar.hidden && bar.bounds.size.width > 100;
+    if (!valid) {
+        NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+        if (now - self.lastChargeBarScan < 5.0) return;
+        self.lastChargeBarScan = now;
+        bar = [self scanChargeBarView];
+        self.chargeBarView = bar;
+        if (!bar) return;
+    }
+    if (CGAffineTransformIsIdentity(bar.transform)) {
+        CGSize b = bar.bounds.size;
+        // 目标 center：左边缘竖放（旋转后占宽 = 原高）；平移量直接写进 transform
+        CGFloat dx = (b.height / 2 + kChargeBarEdge) - bar.center.x;
+        CGFloat dy = kChargeBarCenterY - bar.center.y;
+        CGAffineTransform t = CGAffineTransformMakeRotation(M_PI_2);   // 顺时针 90°，电量填充端朝上
+        t.tx = dx;
+        t.ty = dy;
+        [UIView performWithoutAnimation:^{ bar.transform = t; }];
+        NBLOG(@"[充电条] 已挪至左边缘竖放（原center %@ size %@）",
+              NSStringFromCGPoint(bar.center), NSStringFromCGSize(b));
+    }
+}
+
+// 一键恢复时把充电条放回原位（center 没动过，Identity 即回原位）
+- (void)restoreChargeBar {
+    UIView *bar = self.chargeBarView;
+    if (bar && !CGAffineTransformIsIdentity(bar.transform)) {
+        [UIView performWithoutAnimation:^{ bar.transform = CGAffineTransformIdentity; }];
+        NBLOG(@"[充电条] 已还原");
+    }
+}
+
 // 选一段视频（mp4/mov），拷到沙盒，循环播放（默认静音，可在菜单开声音）
 - (void)pickVideoFor:(NSString *)slot {
     self.pickingSlot = slot;
@@ -1916,6 +1996,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     [d removeObjectForKey:kKeyBgRect];
     [d removeObjectForKey:kKeyBgVideoPath];
     [self teardownVideoLayer];
+    [self restoreChargeBar];             // 充电条放回原位（不影响 App 自己的显示/隐藏逻辑）
     self.cachedBgImage = nil;
     self.cachedBgPath = nil;
     self.pendingStageRestore = YES;      // 万一此刻不在车控页，回车控页再还
