@@ -54,7 +54,8 @@ static NSString * const kKeyVehRect   = @"nbskin_veh_rect"; // 相对「原车�
 static NSString * const kKeyBgRect    = @"nbskin_bg_rect";  // 背景绘制区域（相对舞台）
 static NSString * const kKeyBgMode    = @"nbskin_bg_mode";  // 0=整个上半屏 1=车控区域
 static NSString * const kKeyBgSrcPath = @"nbskin_bg_src";   // 裁剪前的原图（再次裁剪用）
-static NSString * const kKeyBgVideoPath = @"nbskin_bg_video_path"; // 背景视频（循环静音播放）
+static NSString * const kKeyBgVideoPath = @"nbskin_bg_video_path"; // 背景视频（循环播放）
+static NSString * const kKeyBgVideoSound = @"nbskin_bg_video_sound"; // 背景视频声音：1=有声 0/未设=静音（默认静音）
 
 // 「车控区域」的上边界（相对舞台高度）。
 // 舞台高 441.47；cell 内容区从 y=103 起（「车控」标题那一行）→ 103 / 441.47 ≈ 0.2333
@@ -622,7 +623,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 @property (strong, nonatomic) UIImage *cachedBgImage;         // 背景解码缓存（避免每次 apply 都读盘解码）
 @property (copy,   nonatomic) NSString *cachedBgPath;
 
-// 背景视频（无限循环、静音，挂在舞台图层之上、车按钮之下）
+// 背景视频（无限循环，声音可切换，挂在舞台图层之上、车按钮之下）
 // 循环用 AVPlayerItemDidPlayToEndTime 通知 seek 回开头 —— 不依赖 AVPlayerLooper
 @property (strong, nonatomic) AVPlayer *bgPlayer;
 @property (strong, nonatomic) AVPlayerLayer *bgLayer;
@@ -860,8 +861,12 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     [ac addAction:[UIAlertAction actionWithTitle:@"替换【背景图片】（选图后可裁剪）" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *action){ [weakSelf pickImageFor:@"bg"]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"重新裁剪背景图" style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *action){ [weakSelf recropBackground]; }]];    [ac addAction:[UIAlertAction actionWithTitle:@"替换【背景视频】（循环播放 · 静音）" style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *action){ [weakSelf recropBackground]; }]];    [ac addAction:[UIAlertAction actionWithTitle:@"替换【背景视频】（循环播放）" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *action){ [weakSelf pickVideoFor:@"bgvideo"]; }]];
+    NSString *soundName = [self bgVideoSoundOn] ? @"有声" : @"静音";
+    [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"背景视频声音（当前：%@）", soundName]
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *action){ [weakSelf chooseBgVideoSound]; }]];
     NSString *modeName = ([self bgMode] == 0) ? @"整个上半屏" : @"车控区域";
     [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"背景显示方式（%@）", modeName]
                                            style:UIAlertActionStyleDefault
@@ -870,8 +875,6 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
                                          handler:^(UIAlertAction *action){ [weakSelf oneKeyRestore]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"调试：导出视图树" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *action){ [weakSelf dumpViewTree]; }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"调试：投屏/主题诊断" style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *action){ [weakSelf diagnoseProjectionAndTheme]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel
                                          handler:^(UIAlertAction *action){ [weakSelf unhideBall]; }]];
 
@@ -1278,7 +1281,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
         [self restoreCarViews];
     }
 
-    // 5) 背景视频（有视频就盖在背景上，循环静音）
+    // 5) 背景视频（有视频就盖在背景上，循环，声音可切换）
     [self applyVideoLayer];
 }
 
@@ -1665,10 +1668,50 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 }
 
 #pragma mark - 背景视频
-// 一段静音循环的视频铺在背景上：
+// 一段循环视频铺在背景上：
 //   · 层级：舞台图层 < 视频层 < 车按钮容器（车、水印照常画在上面）
 //   · frame 跟随「背景显示方式」：整个上半屏 = 舞台全幅；车控区域 = 只铺那一块
-//   · AVPlayerLooper 无限循环，muted 静音，不占音频会话
+//   · 播完 seek 回开头循环；默认静音，可在菜单里开声音（不占系统音频会话的额外配置）
+
+// 背景视频是否有声。默认静音（未设置 = NO）。
+- (BOOL)bgVideoSoundOn {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:kKeyBgVideoSound];
+}
+
+// 菜单二级选择：静音 / 有声。切换后立即作用于正在播放的 player，不重建播放器。
+- (void)chooseBgVideoSound {
+    UIViewController *top = [self topVC];
+    if (!top) { [self unhideBall]; return; }
+    BOOL on = [self bgVideoSoundOn];
+    NSString *title = on ? @"背景视频声音（当前：有声）" : @"背景视频声音（当前：静音）";
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
+                                                                message:@"静音 = 只显示画面不出声（默认）；有声 = 跟随系统媒体音量播放。"
+                                                         preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak NBManager *weakSelf = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"🔇 静音"
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a){ [weakSelf setBgVideoSound:NO]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"🔊 有声"
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a){ [weakSelf setBgVideoSound:YES]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel
+                                         handler:^(UIAlertAction *a){ [weakSelf unhideBall]; }]];
+    if (ac.popoverPresentationController) {
+        ac.popoverPresentationController.sourceView = self.ballButton ?: top.view;
+        ac.popoverPresentationController.sourceRect = (self.ballButton ?: top.view).bounds;
+    }
+    [top presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)setBgVideoSound:(BOOL)on {
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:kKeyBgVideoSound];
+    // 立即生效：只改现有 player 的 muted，不动播放器/图层，画面不中断
+    if (self.bgPlayer) self.bgPlayer.muted = !on;
+    NBLOG(@"[视频] 声音 -> %@", on ? @"有声" : @"静音");
+    [self alertDone:on ? @"背景视频已开声音\n音量跟随系统媒体音量（侧边音量键可调）。"
+                       : @"背景视频已静音\n只保留画面。"];
+}
+
 - (BOOL)hasBgVideo {
     NSString *p = [[NSUserDefaults standardUserDefaults] stringForKey:kKeyBgVideoPath];
     return p.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:p];
@@ -1705,7 +1748,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
         }
         AVPlayerItem *item = [(id)playerItemCls playerItemWithURL:[NSURL fileURLWithPath:vpath]];
         AVPlayer *p = [(id)playerCls playerWithPlayerItem:item];
-        p.muted = YES;
+        p.muted = ![self bgVideoSoundOn];
         // 播完不要自动暂停（AVPlayerActionAtItemEndNone = 2），否则停在最后一帧不动。
         // 用 KVC 设置，避免 Theos SDK 头文件里缺这个枚举类型。
         @try { [p setValue:@(2) forKey:@"actionAtItemEnd"]; }
@@ -1761,7 +1804,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     return cs >= ds - 0.12;
 }
 
-// 选一段视频（mp4/mov），拷到沙盒，循环静音播放
+// 选一段视频（mp4/mov），拷到沙盒，循环播放（默认静音，可在菜单开声音）
 - (void)pickVideoFor:(NSString *)slot {
     self.pickingSlot = slot;
     PHPickerConfiguration *cfg = [[PHPickerConfiguration alloc] init];
@@ -1812,7 +1855,8 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
             [self applyOverlays];        // 里面会挂视频层
             [self scheduleReapply];
             NSString *modeNote = ([self bgMode] == 0) ? @"整个上半屏" : @"车控区域";
-            [self alertDone:[NSString stringWithFormat:@"背景视频已应用\\n静音循环 · %@\\n（同比例竖版视频效果最好）", modeNote]];
+            NSString *soundNote = [self bgVideoSoundOn] ? @"有声" : @"静音";
+            [self alertDone:[NSString stringWithFormat:@"背景视频已应用\\n%@循环 · %@\\n（同比例竖版视频效果最好）", soundNote, modeNote]];
         });
     });
 }
@@ -1926,105 +1970,8 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     NBLOG(@"[调试] 导出 %lu 字节", (unsigned long)out.length);
 }
 
-// 诊断：投屏（外部屏）+ App 里的仪表主题/壁纸资源。
-// 目的：确认「导航息屏投屏」是系统外部屏还是 App 自己截屏发送，
-// 以及官方主题包/壁纸在沙盒里长什么样（格式、尺寸、命名），为自定义壁纸铺路。
-- (void)diagnoseProjectionAndTheme {
-    NSMutableString *out = [NSMutableString stringWithCapacity:16384];
-    [out appendFormat:@"==== NinebotSkin %@ 诊断 %@ ====\n", NB_VERSION, [NSDate date]];
-    [out appendFormat:@"bundle=%@\nhome=%@\n", [[NSBundle mainBundle] bundleIdentifier], NSHomeDirectory()];
-
-    // ---------- 屏幕 ----------
-    NSArray<UIScreen *> *screens = [UIScreen screens];
-    [out appendFormat:@"\n[UIScreen.screens] count=%lu\n", (unsigned long)screens.count];
-    for (UIScreen *s in screens) {
-        [out appendFormat:@"  bounds=%@ native=%@ scale=%.2f brightness=%.2f mirrored=%@\n",
-         NSStringFromCGRect(s.bounds), NSStringFromCGRect(s.nativeBounds), s.scale, s.brightness,
-         s.mirroredScreen ? NSStringFromCGRect(s.mirroredScreen.bounds) : @"nil"];
-    }
-
-    // ---------- 窗口场景 ----------
-    [out appendString:@"\n[UIWindowScene]\n"];
-    for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
-        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
-        UIWindowScene *ws = (UIWindowScene *)sc;
-        [out appendFormat:@"  scene=%@ activation=%ld windows=%lu\n",
-         NSStringFromCGRect(ws.coordinateSpace.bounds), (long)ws.activationState,
-         (unsigned long)ws.windows.count];
-        for (UIWindow *w in ws.windows) {
-            [out appendFormat:@"    win %@ level=%.0f bounds=%@ hidden=%d\n",
-             NSStringFromClass([w class]), w.windowLevel, NSStringFromCGRect(w.bounds), (int)w.hidden];
-        }
-    }
-
-    // ---------- 投屏相关框架是否加载 ----------
-    NSArray<NSString *> *probe = @[@"RPBroadcastSampleHandler", @"ReplayKit", @"MPExternalDisplay",
-                                   @"AirPlaySender", @"NinebotMirror", @"Mirror", @"Projection",
-                                   @"CarPlay", @"ScreenCast", @"Cast"];
-    [out appendString:@"\n[已加载的投屏/镜像相关类]\n"];
-    for (NSString *name in probe) {
-        if (objc_getClass(name.UTF8String)) [out appendFormat:@"  %@ = YES\n", name];
-    }
-
-    // ---------- 沙盒里的主题/壁纸资源 ----------
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray<NSString *> *kw = @[@"theme", @"wallpaper", @"skin", @"instrument", @"dashboard",
-                                @"meter", @"panel", @"clock", @"ridey", @"表盘", @"仪表"];
-    NSMutableArray<NSString *> *hits = [NSMutableArray array];
-    NSString *dumpDir = [NBLogDir() stringByAppendingPathComponent:@"theme_dump"];
-    [fm createDirectoryAtPath:dumpDir withIntermediateDirectories:YES attributes:nil error:NULL];
-    unsigned long long copied = 0;
-    NSUInteger seq = 0;
-    NSArray<NSString *> *roots = @[@"Documents", @"Library", @"tmp"];
-    for (NSString *r in roots) {
-        NSString *rootPath = [NSHomeDirectory() stringByAppendingPathComponent:r];
-        NSDirectoryEnumerator<NSString *> *en = [fm enumeratorAtPath:rootPath];
-        for (NSString *rel in en) {
-            NSString *lower = rel.lowercaseString;
-            BOOL hit = NO;
-            for (NSString *k in kw) {
-                if ([lower containsString:k]) { hit = YES; break; }
-            }
-            if (!hit) continue;
-            NSString *full = [rootPath stringByAppendingPathComponent:rel];
-            NSDictionary *at = [fm attributesOfItemAtPath:full error:NULL];
-            if (![at[NSFileType] isEqual:NSFileTypeRegular]) continue;
-            unsigned long long sz = [at[NSFileSize] unsignedLongLongValue];
-            if (sz > 24ULL * 1024ULL * 1024ULL) continue;
-            [hits addObject:[NSString stringWithFormat:@"%@ | %llu B", full, sz]];
-            // 小文件顺手拷一份出来，方便直接看格式
-            if (copied + sz <= 40ULL * 1024ULL * 1024ULL && hits.count <= 150) {
-                NSString *name = rel.lastPathComponent;
-                if (!name.length) continue;
-                NSString *dst = [dumpDir stringByAppendingPathComponent:
-                                 [NSString stringWithFormat:@"%03lu_%@", (unsigned long)seq, name]];
-                if ([fm copyItemAtPath:full toPath:dst error:NULL]) {
-                    copied += sz;
-                    seq += 1;
-                }
-            }
-        }
-    }
-    [out appendFormat:@"\n[沙盒主题/壁纸资源] 命中 %lu 个\n", (unsigned long)hits.count];
-    for (NSString *line in hits) [out appendFormat:@"  %@\n", line];
-    [out appendFormat:@"\n已拷贝 %lu 个文件（共 %llu B）到：%@\n",
-     (unsigned long)seq, copied, dumpDir];
-
-    // ---------- 主题页当前视图（如果此刻正停在主题页，能抓到列表的资源名） ----------
-    UIWindow *win = [self appMainWindow];
-    if (win) {
-        [out appendString:@"\n[当前顶层视图树]\n"];
-        [self dump:win.rootViewController.view to:out depth:0];
-    }
-
-    NSString *path = [NBLogDir() stringByAppendingPathComponent:@"diagnose.txt"];
-    [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL];
-    [self alertDone:[NSString stringWithFormat:@"诊断已导出：\n%@\n\n同目录 theme_dump/ 里是抓到的主题资源", path]];
-    NBLOG(@"[诊断] 屏幕 %lu 块，主题命中 %lu 个，导出 %lu 字节",
-          (unsigned long)screens.count, (unsigned long)hits.count, (unsigned long)out.length);
-}
-
-- (void)dump:(UIView *)view to:(NSMutableString *)out depth:(NSInteger)depth {    if (!view || depth > 16) return;
+- (void)dump:(UIView *)view to:(NSMutableString *)out depth:(NSInteger)depth {
+    if (!view || depth > 16) return;
     [out appendFormat:@"%@%@ frame=%@ alpha=%.2f hidden=%d bg=%@ img=%@ %@\n",
      [@"" stringByPaddingToLength:depth * 2 withString:@" " startingAtIndex:0],
      NSStringFromClass([view class]),
