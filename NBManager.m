@@ -56,6 +56,7 @@ static NSString * const kKeyBgMode    = @"nbskin_bg_mode";  // 0=整个上半屏
 static NSString * const kKeyBgSrcPath = @"nbskin_bg_src";   // 裁剪前的原图（再次裁剪用）
 static NSString * const kKeyBgVideoPath = @"nbskin_bg_video_path"; // 背景视频（循环播放）
 static NSString * const kKeyBgVideoSound = @"nbskin_bg_video_sound"; // 背景视频声音：1=有声 0/未设=静音（默认静音）
+static NSString * const kKeyHideVehicle = @"nbskin_hide_vehicle";  // 隐藏车辆图片：1=隐藏
 
 // 「车控区域」的上边界（相对舞台高度）。
 // 舞台高 441.47；cell 内容区从 y=103 起（「车控」标题那一行）→ 103 / 441.47 ≈ 0.2333
@@ -779,35 +780,35 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     }
 
     // 车：图层丢了 / 被换父视图 → 重挂；只是位置变了 → 跟着布局走（不重算图像）
-    if (self.vehicleView) {
+    // 「隐藏车辆图片」开着时即使没有替换图层也要维护（防 App 恢复原车显示）
+    BOOL hideVeh = [[NSUserDefaults standardUserDefaults] boolForKey:kKeyHideVehicle];
+    if (self.vehicleView || hideVeh) {
         UIView *car = self.carView;
         UIImageView *vv = self.vehicleView;
         if (!car || !car.superview || !car.window) {
-            NBLOG(@"[看门狗] 找不到原车视图，重新应用");
-            [self applyOverlays];
-            return;
-        }
-        if (vv.superview != car.superview || !vv.window) {
+            // 纯隐藏模式没有图层可挂，car 找不到时静默跳过（别每 0.2s 空转 applyOverlays）
+            if (vv) { NBLOG(@"[看门狗] 找不到原车视图，重新应用"); [self applyOverlays]; return; }
+        } else if (vv && (vv.superview != car.superview || !vv.window)) {
             NBLOG(@"[看门狗] 车辆图层掉了，重新挂上");
             [self applyOverlays];
             return;
-        }
-        if (vv.image == nil) {
+        } else if (vv && vv.image == nil) {
             NBLOG(@"[看门狗] 车辆图层图被清空，重新应用");
             [self applyOverlays];
             return;
-        }
-        // 被 App 的 layoutSubviews 压到下面去了 → 拎回最上层
-        if (vv.superview.subviews.lastObject != vv) {
-            [vv.superview bringSubviewToFront:vv];
-            NBLOG(@"[看门狗] 车辆图层被压到下层，已拎回最上");
-        }
-        if (!self.adjusting) {
-            CGRect want = [self vehicleFrameForCarView:car];
-            if (!CGRectIsNull(want) && !CGRectEqualToRect(want, vv.frame)) vv.frame = want;
+        } else if (vv) {
+            // 被 App 的 layoutSubviews 压到下面去了 → 拎回最上层
+            if (vv.superview.subviews.lastObject != vv) {
+                [vv.superview bringSubviewToFront:vv];
+                NBLOG(@"[看门狗] 车辆图层被压到下层，已拎回最上");
+            }
+            if (!self.adjusting) {
+                CGRect want = [self vehicleFrameForCarView:car];
+                if (!CGRectIsNull(want) && !CGRectEqualToRect(want, vv.frame)) vv.frame = want;
+            }
         }
         // 兜底：万一 setHidden: 没拦住（UIKit 内部直接改 layer.hidden 之类）
-        if (!car.hidden && self.carStateSaved) car.hidden = YES;
+        if (car && self.carStateSaved && !car.hidden) car.hidden = YES;
     }
 
     // 背景视频：只在设备页播（离开 = 暂停+摘层，回来 = 重挂续播）；
@@ -833,7 +834,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
             if (!self.bgLayer || !self.bgLayer.superlayer) {
                 NBLOG(@"[看门狗] 设备页但视频层缺失，重挂");
                 [self applyVideoLayer];
-            } else if (self.bgLayer.superlayer != sv.superview.layer) {
+            } else if (self.bgLayer.superlayer != sv.layer) {
                 NBLOG(@"[看门狗] 视频层挂错位置，重挂");
                 [self applyVideoLayer];
             } else if ([self bgVideoAtEnd]) {
@@ -909,6 +910,10 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     __weak NBManager *weakSelf = self;
     [ac addAction:[UIAlertAction actionWithTitle:@"替换【车辆图片】" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *action){ [weakSelf pickImageFor:@"veh"]; }]];
+    NSString *hideName = [[NSUserDefaults standardUserDefaults] boolForKey:kKeyHideVehicle] ? @"已隐藏" : @"显示中";
+    [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"隐藏车辆图片（当前：%@）", hideName]
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *action){ [weakSelf toggleHideVehicle]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"替换【背景图片】（选图后可裁剪）" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *action){ [weakSelf pickImageFor:@"bg"]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"重新裁剪背景图" style:UIAlertActionStyleDefault
@@ -937,6 +942,18 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 }
 
 - (void)unhideBall { self.ballWindow.hidden = NO; }
+
+// 隐藏车辆图片开关：整个车辆区域空白（原车 + 我们的替换图层都藏）；
+// 点车辆进详情的功能保留（只藏图，不碰 UIButton）。再点一次恢复。
+- (void)toggleHideVehicle {
+    BOOL cur = [[NSUserDefaults standardUserDefaults] boolForKey:kKeyHideVehicle];
+    [[NSUserDefaults standardUserDefaults] setBool:!cur forKey:kKeyHideVehicle];
+    [self applyOverlays];
+    [self scheduleReapply];
+    NBLOG(@"[车视图] 隐藏车辆图片 -> %@", !cur ? @"隐藏" : @"显示");
+    [self alertDone:!cur ? @"车辆图片已隐藏\n（点车辆进详情的功能不受影响；再点一次「隐藏车辆图片」可恢复）"
+                         : @"车辆图片已恢复显示"];
+}
 
 - (void)presentTracked:(UIViewController *)vc {
     UIViewController *top = [self topVC];
@@ -1033,7 +1050,9 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 }
 
 - (BOOL)hasAnyReplacement {
+    // 「隐藏车辆图片」也算活动替换：否则看门狗提前 return，原车被 App 恢复显示时没人管
     return [self hasBgVideo] ||
+           [[NSUserDefaults standardUserDefaults] boolForKey:kKeyHideVehicle] ||
            [self storedPathForSlot:@"bg"] != nil ||
            [self storedPathForSlot:@"veh"] != nil;
 }
@@ -1208,7 +1227,23 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 //   只插到紧邻上层会被它们盖住 —— 这正是之前"贴了却看不见"的原因。
 //   而微调框一直是用 addSubview 挂同一个父视图的，实测看得见，所以照它来。
 - (void)applyVehicleOverlay:(UIImage *)veh toCarView:(UIView *)v {
-    if (!v || !v.superview || !veh) return;
+    if (!v || !v.superview) return;
+
+    // 纯隐藏模式（菜单「隐藏车辆图片」开、但没有替换图）：整个车辆区域空白。
+    // 原车藏掉 + gNBCarGuard 保护（App 想设回可见会被 setHidden: 拦截器当场打回）。
+    if (!veh) {
+        [self.vehicleView removeFromSuperview];
+        self.vehicleView = nil;
+        if (!self.carStateSaved) {
+            self.carStateSaved = YES;
+            self.carWasHidden = v.hidden;
+            self.carWasAlpha = v.alpha;
+        }
+        gNBCarGuard = v;
+        if (!v.hidden) v.hidden = YES;
+        NBLOG(@"[车视图] 隐藏车辆图片（无替换图，原车藏掉）");
+        return;
+    }
 
     if (!self.vehicleView) {
         UIImageView *vv = [UIImageView new];
@@ -1348,9 +1383,11 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     }
 
     // 4) 车辆 —— 贴在原车按钮最上层 + 藏原车（微调框验证过这条渲染路径）
-    if (vehImg && car) {
+    //    「隐藏车辆图片」开启时：有替换图 = 显示替换图；没有 = 整块空白（原车也藏）
+    BOOL hideVeh = [[NSUserDefaults standardUserDefaults] boolForKey:kKeyHideVehicle];
+    if ((vehImg || hideVeh) && car) {
         [self applyVehicleOverlay:vehImg toCarView:car];
-    } else if (!vehImg && self.vehicleView) {
+    } else if (!vehImg && !hideVeh && (self.vehicleView || self.carStateSaved)) {
         [self restoreCarViews];
     }
 
@@ -1821,13 +1858,13 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 // ⚠️ 必须关隐式动画：CALayer.frame 赋值默认带 0.25s 动画，那就是"看着有延迟"的来源。
 - (void)syncVideoLayerFrame {
     UIImageView *stage = self.stageView;
-    if (!stage || !stage.superview || !self.bgLayer) return;
+    if (!stage || !self.bgLayer || self.bgLayer.superlayer != stage.layer) return;
+    // 视频层是 stage.layer 的 sublayer：frame 直接用 stage 内部坐标
     CGRect region = [self bgRegionInSize:stage.bounds.size];
-    CGRect inSuper = [stage convertRect:region toView:stage.superview];
-    if (CGRectEqualToRect(self.bgLayer.frame, inSuper)) return;
+    if (CGRectEqualToRect(self.bgLayer.frame, region)) return;
     // 用 performWithoutAnimation 关隐式动画（内部即 CATransaction disableActions），
     // 不直接引 CATransaction：本工程刻意不链接 QuartzCore。
-    [UIView performWithoutAnimation:^{ self.bgLayer.frame = inSuper; }];
+    [UIView performWithoutAnimation:^{ self.bgLayer.frame = region; }];
 }
 
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
@@ -1896,10 +1933,16 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
                                                    object:item];
         NBLOG(@"[视频] 建立 player %@", vpath);
     }
-    if (self.bgLayer.superlayer != stage.superview.layer) {
-        [stage.superview.layer insertSublayer:self.bgLayer above:stage.layer];
+    // 挂到 stage.layer 下作为 sublayer（v0.2.13 起改这里，不再挂 superview）：
+    // 舞台图下拉拉伸时的 transform 缩放 / 位移 / bounds 变化都会自动带动 sublayer ——
+    // 按住不松视频也实时跟着拉伸（KVO 只能捕捉 bounds/center，transform 拉伸收不到）。
+    // 层级：stage contents < 视频层（sublayer 在 contents 之上）；车按钮/水印是 stage
+    // 的兄弟视图，仍画在最上面，不受影响。
+    if (self.bgLayer.superlayer != stage.layer) {
+        [stage.layer addSublayer:self.bgLayer];
     }
-    [self startObservingStage:stage];   // 之后 bounds/center 变化 → KVO 实时同步（下拉/回弹）
+    self.bgLayer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+    [self startObservingStage:stage];   // bounds/center 变化 → KVO 同步（transform 拉伸由父层自动带动）
     [self syncVideoLayerFrame];
     if (self.bgPlayer.rate == 0.0 && [self shouldPlayVideo]) [self.bgPlayer play];
 }
@@ -2074,6 +2117,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     [d removeObjectForKey:kKeyVehPath];
     [d removeObjectForKey:kKeyVehRect];
+    [d removeObjectForKey:kKeyHideVehicle];   // 隐藏车辆也一并还原
     [d removeObjectForKey:kKeyBgPath];
     [d removeObjectForKey:kKeyBgRect];
     [d removeObjectForKey:kKeyBgVideoPath];
