@@ -65,6 +65,8 @@ static CGFloat const kBgRegionTop = 0.2333;
 // 用户红框：屏幕 y≈245~390 → 中心 ≈316 → 容器内 ≈213。
 static CGFloat const kChargeBarCenterY = 214.0;
 static CGFloat const kChargeBarEdge    = 2.0;   // 距屏幕左边缘的边距
+// 0.2.10：缩小装进用户红框（红框 ≈75×183pt，原条旋转后 101×254.7pt → 0.72 正好）
+static CGFloat const kChargeBarScale   = 0.72;
 
 // ---------- 日志 ----------
 static NSString *NBLogDir(void) {
@@ -1904,12 +1906,14 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     }
     if (CGAffineTransformIsIdentity(bar.transform)) {
         CGSize b = bar.bounds.size;
-        // 目标 center：左边缘竖放（旋转后占宽 = 原高）；平移量直接写进 transform
-        CGFloat dx = (b.height / 2 + kChargeBarEdge) - bar.center.x;
+        // 目标 center：左边缘竖放（旋转+缩放后占宽 = 原高×scale）；平移量直接写进 transform
+        CGFloat w = b.height * kChargeBarScale;
+        CGFloat dx = (w / 2 + kChargeBarEdge) - bar.center.x;
         CGFloat dy = kChargeBarCenterY - bar.center.y;
-        CGAffineTransform t = CGAffineTransformMakeRotation(M_PI_2);   // 顺时针 90°，电量填充端朝上
-        t.tx = dx;
-        t.ty = dy;
+        // 0.2.10：逆时针 90°（= 相对旧版上下颠倒）+ 缩小到红框大小。
+        // 手写矩阵避免组合顺序歧义：p' = (s·y + dx, −s·x + dy)
+        CGFloat s = kChargeBarScale;
+        CGAffineTransform t = CGAffineTransformMake(0, -s, s, 0, dx, dy);
         [UIView performWithoutAnimation:^{ bar.transform = t; }];
         NBLOG(@"[充电条] 已挪至左边缘竖放（原center %@ size %@）",
               NSStringFromCGPoint(bar.center), NSStringFromCGSize(b));
