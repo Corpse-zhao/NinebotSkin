@@ -640,6 +640,9 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 @property (weak,   nonatomic) UIView *chargeBarView;
 @property (assign, nonatomic) NSTimeInterval lastChargeBarScan;   // 扫描节流
 
+// 视频层跟随舞台图：KVO 观察 bounds/center，下拉拉伸与回弹全程实时同步
+@property (weak,   nonatomic) UIImageView *observedStage;
+
 // 车：原车视图（只用来定位 / 当挂载点）+ 我们贴上去的车辆图层
 @property (weak,   nonatomic) UIView *carView;             // 爱车按钮里的那个 UIImageView
 @property (strong, nonatomic) UIImageView *vehicleView;    // 我们自己贴的车辆图层（挂在 carView.superview 最上层）
@@ -835,8 +838,9 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
                 [self applyVideoLayer];
             } else if ([self bgVideoAtEnd]) {
                 [self restartBgVideo];
-            } else if (self.bgPlayer.rate == 0.0) {
-                [self.bgPlayer play];
+            } else {
+                [self syncVideoLayerFrame];   // 兜底：KVO 万一丢失，0.2s 内也会校准
+                if (self.bgPlayer.rate == 0.0) [self.bgPlayer play];
             }
         }
     }
@@ -1799,6 +1803,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 }
 
 - (void)teardownVideoLayer {
+    [self stopObservingStage];
     if (self.bgPlayer) {
         [[NSNotificationCenter defaultCenter] removeObserver:self
                                                         name:@"AVPlayerItemDidPlayToEndTime"
@@ -1811,12 +1816,52 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     self.bgVideoPath = nil;
 }
 
+// 视频层 frame 实时跟随舞台图（下拉弹性拉伸 / 松手回弹 全过程）。
+// 之前只在 applyVideoLayer 里算一次 frame，下拉时没人更新 → 跟不上、回弹后不还原。
+// ⚠️ 必须关隐式动画：CALayer.frame 赋值默认带 0.25s 动画，那就是"看着有延迟"的来源。
+- (void)syncVideoLayerFrame {
+    UIImageView *stage = self.stageView;
+    if (!stage || !stage.superview || !self.bgLayer) return;
+    CGRect region = [self bgRegionInSize:stage.bounds.size];
+    CGRect inSuper = [stage convertRect:region toView:stage.superview];
+    if (CGRectEqualToRect(self.bgLayer.frame, inSuper)) return;
+    // 用 performWithoutAnimation 关隐式动画（内部即 CATransaction disableActions），
+    // 不直接引 CATransaction：本工程刻意不链接 QuartzCore。
+    [UIView performWithoutAnimation:^{ self.bgLayer.frame = inSuper; }];
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
+                        change:(NSDictionary *)change context:(void *)context {
+    if (object == self.observedStage && self.bgLayer) {
+        [self syncVideoLayerFrame];
+    }
+}
+
+- (void)startObservingStage:(UIImageView *)stage {
+    if (self.observedStage == stage) return;
+    [self stopObservingStage];
+    if (!stage) return;
+    [stage addObserver:self forKeyPath:@"bounds" options:NSKeyValueObservingOptionNew context:NULL];
+    [stage addObserver:self forKeyPath:@"center" options:NSKeyValueObservingOptionNew context:NULL];
+    self.observedStage = stage;
+}
+
+- (void)stopObservingStage {
+    UIImageView *s = self.observedStage;
+    self.observedStage = nil;
+    if (!s) return;
+    // stage 是 weak，可能已被释放：removeObserver 对已释放对象会抛异常，必须兜住
+    @try { [s removeObserver:self forKeyPath:@"bounds"]; } @catch (NSException *e) { (void)e; }
+    @try { [s removeObserver:self forKeyPath:@"center"]; } @catch (NSException *e) { (void)e; }
+}
+
 - (void)applyVideoLayer {
     UIImageView *stage = self.stageView;
     // 只在设备页播：画面和声音都不能泄漏到其他 tab（v0.2.7 用户反馈问题2/3）。
     // 不满足时暂停+摘层，但保留 player（重建要重新打开文件，慢）；回到设备页看门狗会续播。
     BOOL onPage = stage && stage.window && stage.superview && [self stageOnDevicePage:stage];
     if (!onPage || ![self hasBgVideo]) {
+        [self stopObservingStage];
         if (self.bgPlayer && self.bgPlayer.rate != 0.0) {
             [self.bgPlayer pause];
             NBLOG(@"[视频] 不在设备页，暂停");
@@ -1854,9 +1899,8 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     if (self.bgLayer.superlayer != stage.superview.layer) {
         [stage.superview.layer insertSublayer:self.bgLayer above:stage.layer];
     }
-    CGRect region = [self bgRegionInSize:stage.bounds.size];
-    CGRect inSuper = [stage convertRect:region toView:stage.superview];
-    if (!CGRectEqualToRect(self.bgLayer.frame, inSuper)) self.bgLayer.frame = inSuper;
+    [self startObservingStage:stage];   // 之后 bounds/center 变化 → KVO 实时同步（下拉/回弹）
+    [self syncVideoLayerFrame];
     if (self.bgPlayer.rate == 0.0 && [self shouldPlayVideo]) [self.bgPlayer play];
 }
 
