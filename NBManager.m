@@ -1941,7 +1941,8 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     if (self.bgLayer.superlayer != stage.layer) {
         [stage.layer addSublayer:self.bgLayer];
     }
-    self.bgLayer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+    // 注：CALayer.autoresizingMask 在 iOS 上不可用（macOS 专属）——bounds 变化由 KVO
+    // 同步（syncVideoLayerFrame）覆盖；transform 拉伸由父层自动带动 sublayer，无需额外处理。
     [self startObservingStage:stage];   // bounds/center 变化 → KVO 同步（transform 拉伸由父层自动带动）
     [self syncVideoLayerFrame];
     if (self.bgPlayer.rate == 0.0 && [self shouldPlayVideo]) [self.bgPlayer play];
