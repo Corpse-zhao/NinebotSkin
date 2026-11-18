@@ -658,6 +658,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 @property (strong, nonatomic) UIPanGestureRecognizer *adjustPan;
 @property (strong, nonatomic) UIPinchGestureRecognizer *adjustPinch;
 @property (strong, nonatomic) NSTimer *watchdog;
+@property (strong, nonatomic) CADisplayLink *displayLink;   // 视频层每帧跟随
 @property (assign, nonatomic) NSTimeInterval lastVideoRestart;   // 重播防抖
 @end
 
@@ -727,6 +728,7 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
         [self applyOverlays];
         [self scheduleReapply];
         [self startWatchdog];
+        [self startDisplaySync];
     });
 }
 
@@ -1865,12 +1867,32 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 - (void)syncVideoLayerFrame {
     UIImageView *stage = self.stageView;
     if (!stage || !self.bgLayer || self.bgLayer.superlayer != stage.layer) return;
-    // 视频层是 stage.layer 的 sublayer：frame 直接用 stage 内部坐标
-    CGRect region = [self bgRegionInSize:stage.bounds.size];
+    // 读视觉真实状态：普通拖动读 model bounds；App 弹簧动画期间读 presentationLayer
+    //（动画插值中的尺寸也能跟）。九号 App 拖动时直接在 layer 层改尺寸，UIView 的
+    // KVO 收不到 —— 所以这里由 CADisplayLink 每帧驱动，不依赖任何通知。
+    CALayer *pl = stage.layer.presentationLayer;
+    CGSize sz = pl ? pl.bounds.size : stage.bounds.size;
+    CGRect region = [self bgRegionInSize:sz];
     if (CGRectEqualToRect(self.bgLayer.frame, region)) return;
     // 用 performWithoutAnimation 关隐式动画（内部即 CATransaction disableActions），
     // 不直接引 CATransaction：本工程刻意不链接 QuartzCore。
     [UIView performWithoutAnimation:^{ self.bgLayer.frame = region; }];
+}
+
+// 每帧同步：无论 App 用 transform/bounds/frame/布局动画哪种手段拉伸舞台图，
+// 下一帧内视频层必然跟上（每帧只是读一次 bounds + 比较一次 frame，开销可忽略）。
+- (void)startDisplaySync {
+    if (self.displayLink) return;
+    CADisplayLink *link = [CADisplayLink displayLinkWithTarget:self selector:@selector(displayTick)];
+    [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    self.displayLink = link;
+    NBLOG(@"[视频] 每帧同步启动（CADisplayLink）");
+}
+
+- (void)displayTick {
+    UIImageView *stage = self.stageView;
+    if (!self.bgLayer || !stage || !stage.window) return;
+    [self syncVideoLayerFrame];
 }
 
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
