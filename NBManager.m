@@ -1867,12 +1867,14 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
 - (void)syncVideoLayerFrame {
     UIImageView *stage = self.stageView;
     if (!stage || !self.bgLayer || self.bgLayer.superlayer != stage.layer) return;
-    // 读视觉真实状态：普通拖动读 model bounds；App 弹簧动画期间读 presentationLayer
-    //（动画插值中的尺寸也能跟）。九号 App 拖动时直接在 layer 层改尺寸，UIView 的
-    // KVO 收不到 —— 所以这里由 CADisplayLink 每帧驱动，不依赖任何通知。
-    CALayer *pl = stage.layer.presentationLayer;
-    CGSize sz = pl ? pl.bounds.size : stage.bounds.size;
-    CGRect region = [self bgRegionInSize:sz];
+    // 读 model bounds（不是 presentationLayer）：拖动中 App 直改 layer 尺寸，model 即真实值；
+    // 上一版读 presentationLayer 把动画插值尺寸写进 model 坐标系，回弹动画变换叠加后视频错位
+    //（用户看到的"回弹被压在下面/变形"）。宁可回弹时快速归位，也不错位。
+    CGRect b = stage.layer.bounds;
+    CGRect region = [self bgRegionInSize:b.size];
+    // 层级防御：回弹时 App 可能往 stage.layer 里插新层压住视频，掉了最顶就重新挂回
+    NSArray<CALayer *> *subs = stage.layer.sublayers;
+    if (subs.count && subs.lastObject != self.bgLayer) [stage.layer addSublayer:self.bgLayer];
     if (CGRectEqualToRect(self.bgLayer.frame, region)) return;
     // 用 performWithoutAnimation 关隐式动画（内部即 CATransaction disableActions），
     // 不直接引 CATransaction：本工程刻意不链接 QuartzCore。
