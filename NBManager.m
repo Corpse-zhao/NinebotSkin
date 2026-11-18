@@ -909,7 +909,11 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
                                                          preferredStyle:UIAlertControllerStyleActionSheet];
     __weak NBManager *weakSelf = self;
     [ac addAction:[UIAlertAction actionWithTitle:@"替换【车辆图片】" style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *action){ [weakSelf pickImageFor:@"veh"]; }]];
+                                         handler:^(UIAlertAction *action){
+        // 隐藏状态下选新车图：自动取消隐藏，否则新图会被"隐藏优先"逻辑挡住，看着像没生效
+        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:kKeyHideVehicle];
+        [weakSelf pickImageFor:@"veh"];
+    }]];
     NSString *hideName = [[NSUserDefaults standardUserDefaults] boolForKey:kKeyHideVehicle] ? @"已隐藏" : @"显示中";
     [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"隐藏车辆图片（当前：%@）", hideName]
                                            style:UIAlertActionStyleDefault
@@ -1383,9 +1387,11 @@ static void NBCarSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
     }
 
     // 4) 车辆 —— 贴在原车按钮最上层 + 藏原车（微调框验证过这条渲染路径）
-    //    「隐藏车辆图片」开启时：有替换图 = 显示替换图；没有 = 整块空白（原车也藏）
+    //    隐藏优先：开了「隐藏车辆图片」就连同替换图层一起藏（否则只藏原车，换过的车图还留在屏幕上）
     BOOL hideVeh = [[NSUserDefaults standardUserDefaults] boolForKey:kKeyHideVehicle];
-    if ((vehImg || hideVeh) && car) {
+    if (hideVeh && car) {
+        [self applyVehicleOverlay:nil toCarView:car];
+    } else if (vehImg && car) {
         [self applyVehicleOverlay:vehImg toCarView:car];
     } else if (!vehImg && !hideVeh && (self.vehicleView || self.carStateSaved)) {
         [self restoreCarViews];
