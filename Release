@@ -1,0 +1,17 @@
+Origin: NinebotSkin
+Label: NinebotSkin
+Suite: stable
+Version: 1.0
+Codename: ios
+Architectures: iphoneos-arm64e
+Components: main
+Description: NinebotSkin 九号出行增强插件源
+Date: Thu, 19 Nov 2026 05:32:24 UTC
+MD5Sum:
+ d8424215c13ffda64a95c0d9239fe5d3 591 Packages
+ 870459cea4c2a8b4d920addff90a8d58 455 Packages.gz
+ 9782b88a8fe90c4fed93088b090c60ad 484 Packages.bz2
+SHA256:
+ 62539a78e9e1a577b1bb76bca501b879fa48f96377fb57823ad3eecaea9c5ce1 591 Packages
+ 59cb15218bea7c7c122c721331cdbe381b3a5336eb7b07a80bb1b06b51a95348 455 Packages.gz
+ 9f48f4d186c811d3e934f5eb765a0d704e0c0f9c1cafc0302f2820b182a47e36 484 Packages.bz2

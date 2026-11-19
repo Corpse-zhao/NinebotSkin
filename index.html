@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>NinebotSkin 源</title>
+<link rel="icon" href="icons/Icon-128.png">
+<link rel="apple-touch-icon" href="icons/Icon-128.png">
+<style>
+  :root{
+    --bg:#0b0d12; --card:#151922; --line:#242a36;
+    --tx:#e8ecf4; --tx2:#98a2b8; --acc:#3ddc84; --acc2:#1a7f4b;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f5f7fa; --card:#ffffff; --line:#e3e8ef;
+           --tx:#111826; --tx2:#5b6779; --acc:#00a854; --acc2:#007a3d; }
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  body{
+    margin:0;padding:28px 18px 56px;background:var(--bg);color:var(--tx);
+    font:15px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;
+    display:flex;justify-content:center;
+  }
+  .wrap{width:100%;max-width:620px}
+  .head{display:flex;align-items:center;gap:14px;margin-bottom:22px}
+  .logo{
+    width:56px;height:56px;border-radius:15px;flex:0 0 auto;object-fit:cover;
+    box-shadow:0 8px 22px -8px rgba(45,220,132,.65);
+  }
+  h1{font-size:20px;margin:0 0 3px;letter-spacing:.2px}
+  .sub{color:var(--tx2);font-size:13px;margin:0}
+  .card{
+    background:var(--card);border:1px solid var(--line);border-radius:16px;
+    padding:18px;margin-bottom:14px;
+  }
+  .card h2{font-size:13px;margin:0 0 12px;color:var(--tx2);font-weight:600;letter-spacing:.6px;text-transform:uppercase}
+  .urlbox{
+    display:flex;gap:8px;align-items:stretch;
+  }
+  code{
+    flex:1;min-width:0;overflow:auto;white-space:nowrap;
+    background:rgba(127,127,127,.1);border:1px solid var(--line);border-radius:10px;
+    padding:11px 12px;font:13px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  button,.btn{
+    border:0;border-radius:10px;padding:11px 16px;font-size:14px;font-weight:600;
+    background:var(--acc);color:#04120a;cursor:pointer;text-decoration:none;
+    display:inline-flex;align-items:center;justify-content:center;gap:6px;
+    transition:transform .08s ease,opacity .15s ease;
+  }
+  button:active,.btn:active{transform:scale(.97)}
+  .btn.ghost{background:transparent;color:var(--tx);border:1px solid var(--line)}
+  .btnrow{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}
+  ol{margin:6px 0 0;padding-left:20px;color:var(--tx2);font-size:14px}
+  ol li{margin:7px 0}
+  ol b{color:var(--tx);font-weight:600}
+  .meta{display:flex;gap:22px;flex-wrap:wrap;font-size:13px;color:var(--tx2)}
+  .meta span b{color:var(--tx);font-weight:600}
+  .kv{display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid var(--line);font-size:14px}
+  .kv:last-child{border-bottom:0}
+  .kv span:first-child{color:var(--tx2)}
+  .foot{text-align:center;color:var(--tx2);font-size:12px;margin-top:22px;line-height:1.8}
+  a{color:var(--acc)}
+  .toast{
+    position:fixed;left:50%;bottom:34px;transform:translate(-50%,20px);
+    background:#111;color:#fff;padding:10px 18px;border-radius:999px;font-size:13px;
+    opacity:0;pointer-events:none;transition:.22s ease;z-index:9;
+  }
+  .toast.on{opacity:1;transform:translate(-50%,0)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="head">
+    <img class="logo" src="icons/Icon-256.png" alt="NinebotSkin">
+    <div>
+      <h1>NinebotSkin</h1>
+      <p class="sub">九号出行 · 车辆图 / 背景视频替换</p>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>软件源地址</h2>
+    <div class="urlbox">
+      <code id="src">https://corpse-zhao.github.io/NinebotSkin/</code>
+      <button id="copy">复制</button>
+    </div>
+    <div class="btnrow">
+      <a class="btn" id="sileo" href="#">添加到 Sileo</a>
+      <a class="btn ghost" id="zebra" href="#">添加到 Zebra</a>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>手动添加</h2>
+    <ol>
+      <li>打开 <b>Sileo / Zebra</b>，进入「<b>软件源</b>」页</li>
+      <li>点右上角 <b>＋</b>（编辑 → 添加）</li>
+      <li>粘贴上面的地址 → 确认</li>
+      <li>刷新源，搜索 <b>NinebotSkin</b> 安装</li>
+    </ol>
+  </div>
+
+  <div class="card">
+    <h2>当前版本</h2>
+    <div class="kv"><span>版本</span><span>0.2.16</span></div>
+    <div class="kv"><span>架构</span><span>iphoneos-arm64e（roothide）</span></div>
+    <div class="kv"><span>依赖</span><span>mobilesubstrate</span></div>
+    <div class="kv"><span>包体</span><span>58.2KB</span></div>
+  </div>
+
+  <div class="card">
+    <h2>直链下载</h2>
+    <div class="urlbox">
+      <code id="deb">https://corpse-zhao.github.io/NinebotSkin/debs/com.corpsezhao.ninebotskin_0.2.16_iphoneos-arm64e.deb</code>
+      <button id="copyd">复制</button>
+    </div>
+    <div class="btnrow">
+      <a class="btn ghost" href="debs/com.corpsezhao.ninebotskin_0.2.16_iphoneos-arm64e.deb" download>直接下载 deb</a>
+    </div>
+  </div>
+
+  <div class="foot">
+    仅适用于已越狱（roothide）设备 · 自签 ipa 无法安装 deb<br>
+    by Corpse-zhao
+  </div>
+</div>
+
+<div class="toast" id="toast">已复制</div>
+
+<script>
+(function(){
+  var base = location.origin + location.pathname.replace(/[^/]*$/, "");
+  var src  = base;
+  document.getElementById("src").textContent = src;
+
+  var sileoHref = "sileo://source/" + src;
+  var zebraHref = "zbra://sources/add/" + src;
+  document.getElementById("sileo").href = sileoHref;
+  document.getElementById("zebra").href = zebraHref;
+
+  function toast(msg){
+    var t = document.getElementById("toast");
+    t.textContent = msg;
+    t.classList.add("on");
+    clearTimeout(t._h);
+    t._h = setTimeout(function(){ t.classList.remove("on"); }, 1600);
+  }
+  function copy(text, btn){
+    var done = function(){ toast("已复制"); };
+    if (navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).then(done, function(){ fallback(text); done(); });
+    } else { fallback(text); done(); }
+  }
+  function fallback(text){
+    var ta = document.createElement("textarea");
+    ta.value = text; ta.style.position="fixed"; ta.style.opacity="0";
+    document.body.appendChild(ta); ta.select();
+    try{ document.execCommand("copy"); }catch(e){}
+    document.body.removeChild(ta);
+  }
+  document.getElementById("copy").onclick  = function(){ copy(document.getElementById("src").textContent); };
+  document.getElementById("copyd").onclick = function(){ copy(document.getElementById("deb").textContent); };
+})();
+</script>
+</body>
+</html>

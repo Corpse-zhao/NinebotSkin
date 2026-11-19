@@ -1,0 +1,16 @@
+Package: com.corpsezhao.ninebotskin
+Name: NinebotSkin
+Version: 0.2.16
+Architecture: iphoneos-arm64e
+Description: 九号出行 车辆图/背景图替换（图片版）- roothide
+Section: Tweaks
+Depends: mobilesubstrate
+Author: Corpse-zhao
+Maintainer: Corpse-zhao
+Icon: https://corpse-zhao.github.io/NinebotSkin/icons/Icon-256.png
+Filename: debs/com.corpsezhao.ninebotskin_0.2.16_iphoneos-arm64e.deb
+Size: 59562
+Installed-Size: 570
+MD5sum: 7a916c4fdafb45031e7052af46756ac2
+SHA1: 31eb0a188652662a98480dd02dc57477b94774d6
+SHA256: ade950db1621133d014dbc0fa13a18f8f905e0dc34f7d30891119c49a54a7726
